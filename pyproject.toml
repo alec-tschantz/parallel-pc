@@ -1,0 +1,17 @@
+[project]
+name = "ppc"
+version = "0.1.0"
+description = "Compute-optimal predictive coding in JAX"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "jax[cpu]>=0.9.2",
+    "equinox",
+    "optax",
+    "keras>=3.13.2",
+    "tyro>=1.0.10",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
