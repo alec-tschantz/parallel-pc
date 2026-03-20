@@ -54,7 +54,8 @@ def predict(graph: Graph, state: State) -> dict[str, jax.Array]:
 
         sources = []
         for si in range(bucket.meta.n_srcs):
-            gathered = flat[:, bucket.gather_indices[si]]
+            idx = jnp.array(bucket.gather_indices[si])
+            gathered = flat[:, idx]
             src_shape = bucket.meta.src_shapes[si]
             gathered = gathered.reshape(batch, n_edges, *src_shape)
             sources.append(gathered.transpose(1, 0, *range(2, gathered.ndim)))

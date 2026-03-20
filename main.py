@@ -120,43 +120,6 @@ def evaluate(graph, eval_step, x, y, batch_size, key):
     return correct / total, correct, total
 
 
-# ---------------------------------------------------------------------------
-# Benchmarking
-# ---------------------------------------------------------------------------
-
-
-def benchmark(graph, opt_state, train_step, infer_opt, dx, dy, key):
-    key, k1 = jax.random.split(key)
-
-    t0 = time.perf_counter()
-    graph, opt_state, loss = train_step(graph, opt_state, dx, dy, k1)
-    jax.block_until_ready(loss)
-    print(f"Compile time:  {time.perf_counter() - t0:.2f}s")
-
-    t0 = time.perf_counter()
-    n_warmup = 10
-    for _ in range(n_warmup):
-        key, sk = jax.random.split(key)
-        graph, opt_state, loss = train_step(graph, opt_state, dx, dy, sk)
-    jax.block_until_ready(loss)
-    print(f"Avg step time: {(time.perf_counter() - t0) / n_warmup * 1000:.1f}ms")
-
-    key, k2 = jax.random.split(key)
-    dummy_state = ppc.init(graph, {"image": dx, "label": dy}, key=k2)
-    jaxpr = jax.make_jaxpr(lambda s: ppc.infer(graph, s, optimizer=infer_opt, iters=5))(
-        dummy_state
-    )
-    print(f"Jaxpr eqns:    {len(jaxpr.jaxpr.eqns)}  (clean = no dynamic Python ops)")
-    print("-" * 50)
-
-    return graph, opt_state, key
-
-
-# ---------------------------------------------------------------------------
-# Training loop
-# ---------------------------------------------------------------------------
-
-
 def main(cfg: Config):
     key = jax.random.PRNGKey(cfg.seed)
 
@@ -173,11 +136,6 @@ def main(cfg: Config):
 
     train_step = make_train_step(infer_opt, train_opt, cfg.iters)
     eval_step = make_eval_step(infer_opt, cfg.iters)
-
-    dx, dy = x_tr[: cfg.batch_size], y_tr[: cfg.batch_size]
-    graph, opt_state, key = benchmark(
-        graph, opt_state, train_step, infer_opt, dx, dy, key
-    )
 
     for epoch in range(1, cfg.n_epochs + 1):
         t_epoch = time.perf_counter()

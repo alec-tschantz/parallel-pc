@@ -62,7 +62,7 @@ class TransformBucket(eqx.Module):
     static_module: Any = eqx.field(static=True)
     param_treedef: Any = eqx.field(static=True)
     meta: BucketMeta = eqx.field(static=True)
-    gather_indices: tuple = eqx.field(static=True)
+    gather_indices: tuple[tuple[tuple[int, ...], ...], ...] = eqx.field(static=True)
 
 
 # ---------------------------------------------------------------------------
@@ -174,7 +174,10 @@ def _bucket_transforms(
                 edge_srcs.append((o, sz, sh))
                 gather_per_src[si].append(np.arange(o, o + sz))
             src_specs.append(tuple(edge_srcs))
-        gather_indices = tuple(np.stack(g) for g in gather_per_src)
+        gather_indices = tuple(
+            tuple(tuple(int(x) for x in row) for row in np.stack(g))
+            for g in gather_per_src
+        )
 
         tgt_specs = []
         for t in group:
