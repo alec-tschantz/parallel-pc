@@ -1,11 +1,11 @@
 from .types import Variable, Transform, Energy, State
 from .graph import Graph
-from .engine import init, predict, infer, energy, state_grad, param_grad, variable, transform
+from .engine import init, infer, energy, state_grad, param_grad, variable, transform, prediction
 from .utils import mse_energy, cross_entropy_energy
 
 __all__ = [
     "Variable", "Transform", "Energy", "State", "Graph",
-    "init", "predict", "infer", "energy", "state_grad", "param_grad",
-    "variable", "transform",
+    "init", "infer", "energy", "state_grad", "param_grad",
+    "variable", "transform", "prediction",
     "mse_energy", "cross_entropy_energy",
 ]

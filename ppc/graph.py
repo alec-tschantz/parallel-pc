@@ -35,6 +35,32 @@ class CompiledEnergy:
 
 
 @dataclass(frozen=True)
+class VarGather:
+    """Gather from flat buffer for one arg position across all energies in a bucket."""
+
+    gather_indices: tuple[tuple[int, ...], ...]  # (n_energies, size) as nested tuples
+    shape: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class TransformGather:
+    """Gather from predictions flat buffer for one arg position across all energies in a bucket."""
+
+    var_names: tuple[str, ...]  # one per energy
+    gather_indices: tuple[tuple[int, ...], ...]  # (n_energies, size) as nested tuples
+    shape: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class EnergyBucket:
+    """Energies with same fn and arg pattern, batched together."""
+
+    fn: Callable
+    n_energies: int
+    arg_gathers: tuple[VarGather | TransformGather, ...]
+
+
+@dataclass(frozen=True)
 class Layout:
     total_dim: int
     var_names: tuple[str, ...]
@@ -53,6 +79,10 @@ class BucketMeta(NamedTuple):
     n_tgts: int
     src_shapes: tuple[tuple[int, ...], ...]
     tgt_shapes: tuple[tuple[int, ...], ...]
+    tgt_names: tuple[tuple[str, ...], ...]  # per-edge target variable names
+    shared_srcs: tuple[
+        bool, ...
+    ]  # per-source: True if all edges share the same source var
 
 
 class TransformBucket(eqx.Module):
@@ -63,6 +93,9 @@ class TransformBucket(eqx.Module):
     param_treedef: Any = eqx.field(static=True)
     meta: BucketMeta = eqx.field(static=True)
     gather_indices: tuple[tuple[tuple[int, ...], ...], ...] = eqx.field(static=True)
+    scatter_indices: tuple[tuple[tuple[int, ...], ...], ...] = eqx.field(
+        static=True
+    )  # per-tgt: (n_edges, size)
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +110,7 @@ class Graph(eqx.Module):
     layout: Layout = eqx.field(static=True)
     buckets: tuple[TransformBucket, ...]
     compiled_energies: tuple[CompiledEnergy, ...] = eqx.field(static=True)
+    energy_buckets: tuple[EnergyBucket, ...] = eqx.field(static=True)
 
     def __init__(
         self,
@@ -103,6 +137,7 @@ class Graph(eqx.Module):
 
         buckets = _bucket_transforms(txs_, layout)
         compiled = _compile_energies(ens_, txs_, transform_id_to_idx, var_names, layout)
+        e_buckets = _bucket_energies(compiled, layout)
 
         self.variables = vars_
         self.transforms = txs_
@@ -110,6 +145,7 @@ class Graph(eqx.Module):
         self.layout = layout
         self.buckets = tuple(buckets)
         self.compiled_energies = tuple(compiled)
+        self.energy_buckets = tuple(e_buckets)
 
 
 def _build_layout(variables: tuple[Variable, ...]) -> Layout:
@@ -180,6 +216,7 @@ def _bucket_transforms(
         )
 
         tgt_specs = []
+        scatter_per_tgt: list[list] = [[] for _ in range(len(t0.tgt))]
         for t in group:
             tgt_specs.append(
                 tuple(
@@ -187,6 +224,18 @@ def _bucket_transforms(
                     for n in t.tgt
                 )
             )
+            for ti, n in enumerate(t.tgt):
+                o, sz = layout.offsets[n], layout.sizes[n]
+                scatter_per_tgt[ti].append(np.arange(o, o + sz))
+        scatter_indices = tuple(
+            tuple(tuple(int(x) for x in row) for row in np.stack(g))
+            for g in scatter_per_tgt
+        )
+
+        # Detect shared sources: all edges read same var for this src position
+        shared_srcs = tuple(
+            len(set(t.src[si] for t in group)) == 1 for si in range(len(t0.src))
+        )
 
         meta = BucketMeta(
             src_specs=tuple(src_specs),
@@ -196,6 +245,8 @@ def _bucket_transforms(
             n_tgts=len(t0.tgt),
             src_shapes=tuple(layout.shapes[s] for s in t0.src),
             tgt_shapes=tuple(layout.shapes[tgt] for tgt in t0.tgt),
+            tgt_names=tuple(t.tgt for t in group),
+            shared_srcs=shared_srcs,
         )
 
         with warnings.catch_warnings():
@@ -207,6 +258,7 @@ def _bucket_transforms(
                     param_treedef=treedef,
                     meta=meta,
                     gather_indices=gather_indices,
+                    scatter_indices=scatter_indices,
                 )
             )
 
@@ -248,3 +300,77 @@ def _compile_energies(
                 )
         compiled.append(CompiledEnergy(e.fn, tuple(specs)))
     return compiled
+
+
+def _bucket_energies(
+    compiled: list[CompiledEnergy],
+    layout: Layout,
+) -> list[EnergyBucket]:
+    """Group compiled energies by fn + arg pattern for batched evaluation."""
+
+    # Group by (fn, n_args, per-arg type tag + shape)
+    def bucket_key(ce: CompiledEnergy) -> tuple:
+        arg_sig = []
+        for spec in ce.arg_specs:
+            if isinstance(spec, VarArg):
+                arg_sig.append(("var", spec.shape))
+            else:
+                arg_sig.append(("transform",))
+        return (id(ce.fn), tuple(arg_sig))
+
+    groups: dict[tuple, list[int]] = {}
+    for i, ce in enumerate(compiled):
+        key = bucket_key(ce)
+        groups.setdefault(key, []).append(i)
+
+    buckets = []
+    for indices in groups.values():
+        group = [compiled[i] for i in indices]
+        ce0 = group[0]
+        n_args = len(ce0.arg_specs)
+        n_energies = len(group)
+
+        arg_gathers: list[VarGather | TransformGather] = []
+        for ai in range(n_args):
+            spec0 = ce0.arg_specs[ai]
+            if isinstance(spec0, VarArg):
+                # Build gather indices: (n_energies, size) — each row is flat-buffer indices
+                gather_rows = []
+                for ce in group:
+                    s = ce.arg_specs[ai]
+                    assert isinstance(s, VarArg)
+                    gather_rows.append(tuple(range(s.offset, s.offset + s.size)))
+                arg_gathers.append(
+                    VarGather(
+                        gather_indices=tuple(gather_rows),
+                        shape=spec0.shape,
+                    )
+                )
+            else:
+                assert isinstance(spec0, TransformArg)
+                var_names_list = []
+                gather_rows = []
+                for ce in group:
+                    s = ce.arg_specs[ai]
+                    assert isinstance(s, TransformArg)
+                    vn = s.var_name
+                    var_names_list.append(vn)
+                    o, sz = layout.offsets[vn], layout.sizes[vn]
+                    gather_rows.append(tuple(range(o, o + sz)))
+                arg_gathers.append(
+                    TransformGather(
+                        var_names=tuple(var_names_list),
+                        gather_indices=tuple(gather_rows),
+                        shape=layout.shapes[var_names_list[0]],
+                    )
+                )
+
+        buckets.append(
+            EnergyBucket(
+                fn=ce0.fn,
+                n_energies=n_energies,
+                arg_gathers=tuple(arg_gathers),
+            )
+        )
+
+    return buckets

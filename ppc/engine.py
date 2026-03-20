@@ -1,4 +1,4 @@
-"""Functional engine: init, forward, infer, energy, state_grad, param_grad, variable, transform."""
+"""Functional engine: init, infer, energy, state_grad, param_grad, variable, transform, prediction."""
 
 from __future__ import annotations
 
@@ -39,26 +39,36 @@ def init(
 
 
 # ---------------------------------------------------------------------------
-# Forward
+# Predict (internal) — returns dict keyed by target var name
 # ---------------------------------------------------------------------------
 
 
-def predict(graph: Graph, state: State) -> dict[str, jax.Array]:
+def _predict(graph: Graph, flat: jax.Array) -> dict[str, jax.Array]:
     """Run all transform buckets. Returns {target_var_name: (batch, *shape)}."""
-    flat = state.flat
+    batch = flat.shape[0]
     predictions: dict[str, jax.Array] = {}
 
     for bucket in graph.buckets:
         n_edges = len(bucket.meta.transform_indices)
-        batch = flat.shape[0]
 
         sources = []
+        src_in_axes = []
         for si in range(bucket.meta.n_srcs):
-            idx = jnp.array(bucket.gather_indices[si])
-            gathered = flat[:, idx]
             src_shape = bucket.meta.src_shapes[si]
-            gathered = gathered.reshape(batch, n_edges, *src_shape)
-            sources.append(gathered.transpose(1, 0, *range(2, gathered.ndim)))
+            if bucket.meta.shared_srcs[si]:
+                # All edges read the same source — gather once, broadcast via vmap
+                idx = jnp.array(bucket.gather_indices[si][0])
+                gathered = flat[:, idx]  # (batch, size)
+                gathered = gathered.reshape(batch, *src_shape)
+                sources.append(gathered)
+                src_in_axes.append(None)
+            else:
+                # Each edge reads a different source — fancy indexing
+                idx = jnp.array(bucket.gather_indices[si])
+                gathered = flat[:, idx]
+                gathered = gathered.reshape(batch, n_edges, *src_shape)
+                sources.append(gathered.transpose(1, 0, *range(2, gathered.ndim)))
+                src_in_axes.append(0)
 
         def apply_one(params: Any, *src_args: jax.Array) -> jax.Array:
             module = eqx.combine(
@@ -67,16 +77,15 @@ def predict(graph: Graph, state: State) -> dict[str, jax.Array]:
             )
             return jax.vmap(module)(*src_args)
 
-        out = jax.vmap(apply_one, in_axes=(0, *([0] * len(sources))))(
+        out = jax.vmap(apply_one, in_axes=(0, *src_in_axes))(
             bucket.stacked_params, *sources
         )
 
         if bucket.meta.n_tgts == 1:
             out = (out,)
 
-        for ei, tidx in enumerate(bucket.meta.transform_indices):
-            t = graph.transforms[tidx]
-            for oi, tgt_name in enumerate(t.tgt):
+        for ei, tgt_tuple in enumerate(bucket.meta.tgt_names):
+            for oi, tgt_name in enumerate(tgt_tuple):
                 predictions[tgt_name] = out[oi][ei]
 
     return predictions
@@ -90,7 +99,7 @@ def predict(graph: Graph, state: State) -> dict[str, jax.Array]:
 def energy(graph: Graph, state: State) -> jax.Array:
     """Total energy at current state (scalar, summed over batch)."""
     flat = state.flat
-    predictions = predict(graph, state)
+    predictions = _predict(graph, flat)
 
     total: jax.Array = jnp.float32(0.0)
     for ce in graph.compiled_energies:
@@ -159,9 +168,7 @@ def infer(
         flat = optax.apply_updates(flat, updates)
         return (flat, opt_state), None  # type: ignore
 
-    (flat, _), _ = jax.lax.scan(
-        step, (state.flat, opt_state), None, length=iters
-    )
+    (flat, _), _ = jax.lax.scan(step, (state.flat, opt_state), None, length=iters)
     return State(flat=flat, free_mask=free_mask)
 
 
@@ -183,3 +190,11 @@ def transform(graph: Graph, name: str) -> eqx.Module:
         if t.id == name:
             return t.module
     raise KeyError(f"Transform '{name}' not found")
+
+
+def prediction(graph: Graph, state: State, name: str) -> jax.Array:
+    """Run transforms and read a specific prediction by target variable name."""
+    predictions = _predict(graph, state.flat)
+    if name not in predictions:
+        raise KeyError(f"No transform targets '{name}'")
+    return predictions[name]
