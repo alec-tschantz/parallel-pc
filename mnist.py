@@ -20,7 +20,7 @@ import ppc
 class Config:
     seed: int = 42
     batch_size: int = 64
-    epochs: int = 20
+    epochs: int = 50
     iters: int = 20
     infer_lr: float = 0.05
     train_lr: float = 5e-5
