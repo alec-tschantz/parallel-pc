@@ -10,6 +10,7 @@ dependencies = [
     "optax",
     "keras>=3.13.2",
     "tyro>=1.0.10",
+    "matplotlib>=3.10.8",
 ]
 
 [build-system]

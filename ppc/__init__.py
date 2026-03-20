@@ -1,6 +1,6 @@
 from .types import Variable, Transform, Energy, State
 from .graph import Graph
-from .engine import init, infer, energy, state_grad, param_grad, variable, transform, prediction
+from .engine import init, infer, energy, state_grad, param_grad, variable, transform, prediction, _predict
 from .utils import mse_energy, cross_entropy_energy
 
 __all__ = [

@@ -24,11 +24,11 @@ def init(
     *,
     key: jax.Array,
 ) -> State:
-    """Allocate flat buffer, write clamps, init free vars with small randn."""
+    """Allocate flat buffer, write clamps, init free vars with unit-variance randn."""
     batch = next(iter(clamps.values())).shape[0]
     layout = graph.layout
 
-    flat = 0.01 * jax.random.normal(key, (batch, layout.total_dim))
+    flat = 0.1 * jax.random.normal(key, (batch, layout.total_dim))
     free_mask = jnp.ones(layout.total_dim)
     for name, val in clamps.items():
         o, s = layout.offsets[name], layout.sizes[name]

@@ -3,8 +3,8 @@ import jax.numpy as jnp
 
 
 def mse_energy(pred, value):
-    """Mean squared error between prediction and value."""
-    return jnp.mean((pred - value) ** 2)
+    """Squared error between prediction and value (sum reduction, 0.5 factor)."""
+    return 0.5 * jnp.sum((pred - value) ** 2)
 
 
 def cross_entropy_energy(pred, target):

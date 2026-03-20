@@ -36,7 +36,7 @@ graph = ppc.Graph(
     ],
     energies=[
         ppc.Energy(ppc.mse_energy, args=["t1", "h"]),
-        ppc.Energy(ppc.cross_entropy_energy, args=["t2", "y"]),
+        ppc.Energy(ppc.mse_energy, args=["t2", "y"]),
     ],
 )
 
