@@ -11,6 +11,16 @@ from .engine import (
     predict,
 )
 from .utils import mse_energy, cross_entropy_energy
+from .metrics import (
+    edge_jacobian,
+    weighted_jacobian,
+    edge_precision,
+    precision_matrix,
+    eigendecompose,
+    task_residual,
+    decompose,
+    score,
+)
 
 __all__ = [
     "Variable",
@@ -25,6 +35,15 @@ __all__ = [
     "param_grad",
     "variable",
     "transform",
+    "predict",
     "mse_energy",
     "cross_entropy_energy",
+    "edge_jacobian",
+    "weighted_jacobian",
+    "edge_precision",
+    "precision_matrix",
+    "eigendecompose",
+    "task_residual",
+    "decompose",
+    "score",
 ]
