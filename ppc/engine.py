@@ -43,7 +43,7 @@ def init(
 # ---------------------------------------------------------------------------
 
 
-def _predict(graph: Graph, flat: jax.Array) -> dict[str, jax.Array]:
+def predict(graph: Graph, flat: jax.Array) -> dict[str, jax.Array]:
     """Run all transform buckets. Returns {target_var_name: (batch, *shape)}."""
     batch = flat.shape[0]
     predictions: dict[str, jax.Array] = {}
@@ -99,7 +99,7 @@ def _predict(graph: Graph, flat: jax.Array) -> dict[str, jax.Array]:
 def energy(graph: Graph, state: State) -> jax.Array:
     """Total energy at current state (scalar, summed over batch)."""
     flat = state.flat
-    predictions = _predict(graph, flat)
+    predictions = predict(graph, flat)
 
     total: jax.Array = jnp.float32(0.0)
     for ce in graph.compiled_energies:
@@ -190,11 +190,3 @@ def transform(graph: Graph, name: str) -> eqx.Module:
         if t.id == name:
             return t.module
     raise KeyError(f"Transform '{name}' not found")
-
-
-def prediction(graph: Graph, state: State, name: str) -> jax.Array:
-    """Run transforms and read a specific prediction by target variable name."""
-    predictions = _predict(graph, state.flat)
-    if name not in predictions:
-        raise KeyError(f"No transform targets '{name}'")
-    return predictions[name]
