@@ -9,7 +9,9 @@ from .engine import (
     variable,
     transform,
     predict,
+    expand_state,
 )
+from .graph import expand
 from .utils import mse_energy, cross_entropy_energy
 from .metrics import (
     edge_jacobian,
@@ -20,6 +22,8 @@ from .metrics import (
     task_residual,
     decompose,
     score,
+    candidate_jacobian,
+    candidate_novelty,
 )
 
 __all__ = [
@@ -46,4 +50,8 @@ __all__ = [
     "task_residual",
     "decompose",
     "score",
+    "expand",
+    "expand_state",
+    "candidate_jacobian",
+    "candidate_novelty",
 ]

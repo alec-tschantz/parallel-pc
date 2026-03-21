@@ -12,7 +12,7 @@ import jax
 import jax.numpy as jnp
 
 from .graph import Graph
-from .types import State
+from .types import State, Transform
 
 
 # ---------------------------------------------------------------------------
@@ -21,25 +21,34 @@ from .types import State
 
 
 def edge_jacobian(graph: Graph, state: State, transform_idx: int) -> jax.Array:
-    """Jacobian of a single transform's output w.r.t. the flat state buffer.
+    """Jacobian of the residual (pred - target) for a single edge w.r.t. flat state.
 
+    The residual is r_e = f_e(x_src) - x_tgt.  Its Jacobian includes both the
+    transform contribution (df_e/dx) and the target variable contribution (-I_tgt).
     Columns for clamped variables are zeroed (Jacobian is w.r.t. free states only).
     Returns shape (B, d_tgt, D).
     """
     t = graph.transforms[transform_idx]
     layout = graph.layout
 
-    def fwd(flat_single):
+    def residual(flat_single):
         srcs = []
         for s in t.src:
             o, sz, sh = layout.offsets[s], layout.sizes[s], layout.shapes[s]
             srcs.append(flat_single[o : o + sz].reshape(sh))
-        out = t.module(*srcs)  #  type: ignore
+        out = t.module(*srcs)  # type: ignore
         if isinstance(out, tuple):
-            return jnp.concatenate([v.ravel() for v in out])
-        return out.ravel()
+            pred = jnp.concatenate([v.ravel() for v in out])
+        else:
+            pred = out.ravel()
+        tgt_parts = []
+        for n in t.tgt:
+            o, sz = layout.offsets[n], layout.sizes[n]
+            tgt_parts.append(flat_single[o : o + sz])
+        tgt = jnp.concatenate(tgt_parts)
+        return pred - tgt
 
-    J = jax.vmap(jax.jacrev(fwd))(state.flat)
+    J = jax.vmap(jax.jacrev(residual))(state.flat)
     return J * state.free_mask[None, None, :]
 
 
@@ -210,6 +219,58 @@ def decompose(
         "spectral_filter": spectral_filter,
         "effective_rank": effective_rank,
     }
+
+
+def candidate_jacobian(
+    graph: Graph,
+    state: State,
+    transform_obj: Transform,
+) -> jax.Array:
+    """Jacobian of a candidate transform's residual (pred - tgt) w.r.t. flat state.
+
+    The candidate transform is not in the graph; we use graph.layout for variable
+    offsets. Returns shape (B, d_tgt, D).
+    """
+    layout = graph.layout
+    t = transform_obj
+
+    def residual(flat_single):
+        srcs = []
+        for s in t.src:
+            o, sz, sh = layout.offsets[s], layout.sizes[s], layout.shapes[s]
+            srcs.append(flat_single[o : o + sz].reshape(sh))
+        out = t.module(*srcs)  # type: ignore
+        if isinstance(out, tuple):
+            pred = jnp.concatenate([v.ravel() for v in out])
+        else:
+            pred = out.ravel()
+        tgt_parts = []
+        for n in t.tgt:
+            o, sz = layout.offsets[n], layout.sizes[n]
+            tgt_parts.append(flat_single[o : o + sz])
+        tgt = jnp.concatenate(tgt_parts)
+        return pred - tgt
+
+    J = jax.vmap(jax.jacrev(residual))(state.flat)
+    return J * state.free_mask[None, None, :]
+
+
+def candidate_novelty(
+    decomp: dict,
+    candidate_J: jax.Array,
+) -> float:
+    """Frobenius norm of candidate J projected out of current column space.
+
+    Higher novelty means the candidate adds more new directions.
+    decomp: output of decompose().
+    candidate_J: (B, d_c, D) from candidate_jacobian().
+    """
+    eigvecs = decomp["eigenvectors"]  # (D, rank)
+    J_avg = jnp.mean(candidate_J, axis=0)  # (d_c, D)
+    # Project out existing column space
+    proj = J_avg @ eigvecs  # (d_c, rank)
+    J_perp = J_avg - proj @ eigvecs.T  # (d_c, D)
+    return float(jnp.sum(J_perp**2))
 
 
 def score(

@@ -190,3 +190,31 @@ def transform(graph: Graph, name: str) -> eqx.Module:
         if t.id == name:
             return t.module
     raise KeyError(f"Transform '{name}' not found")
+
+
+def expand_state(
+    old_graph: Graph,
+    new_graph: Graph,
+    state: State,
+    *,
+    key: jax.Array,
+) -> State:
+    """Expand a State to match a larger Graph's layout, preserving existing values."""
+    batch = state.flat.shape[0]
+    new_layout = new_graph.layout
+    new_flat = 0.1 * jax.random.normal(key, (batch, new_layout.total_dim))
+    new_free_mask = jnp.ones(new_layout.total_dim)
+
+    old_layout = old_graph.layout
+    for v in old_graph.variables:
+        old_o, old_s = old_layout.offsets[v.name], old_layout.sizes[v.name]
+        new_o = new_layout.offsets[v.name]
+        new_flat = new_flat.at[:, new_o : new_o + old_s].set(
+            state.flat[:, old_o : old_o + old_s]
+        )
+        # Preserve clamped status
+        new_free_mask = new_free_mask.at[new_o : new_o + old_s].set(
+            state.free_mask[old_o : old_o + old_s]
+        )
+
+    return State(flat=new_flat, free_mask=new_free_mask)
