@@ -11,5 +11,4 @@ __pycache__/
 uv.lock
 
 docs/
-scripts/
 outputs/
