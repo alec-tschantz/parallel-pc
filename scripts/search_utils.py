@@ -173,6 +173,55 @@ def plot_energy_gap(
     print(f"Saved energy gap plot to {save_path}")
 
 
+def plot_transform_types(
+    residual_edges: list[str],
+    random_edges_list: list[list[str]],
+    save_path: str,
+):
+    """Bar chart of transform type counts: residual-driven vs random."""
+    import re
+
+    def extract_types(edges):
+        types = {}
+        for e in edges:
+            m = re.search(r"\[(\w+)\]", e)
+            t = m.group(1) if m else "Linear"
+            types[t] = types.get(t, 0) + 1
+        return types
+
+    res_types = extract_types(residual_edges)
+    all_types = set(res_types.keys())
+    rand_type_counts = []
+    for edges in random_edges_list:
+        rt = extract_types(edges)
+        all_types.update(rt.keys())
+        rand_type_counts.append(rt)
+
+    types_sorted = sorted(all_types)
+    x = np.arange(len(types_sorted))
+    width = 0.35
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    res_vals = [res_types.get(t, 0) for t in types_sorted]
+    ax.bar(x - width / 2, res_vals, width, label="Residual-driven", color="steelblue")
+    if rand_type_counts:
+        rand_arr = np.array([[rt.get(t, 0) for t in types_sorted] for rt in rand_type_counts])
+        rand_mean = rand_arr.mean(axis=0)
+        rand_std = rand_arr.std(axis=0)
+        ax.bar(x + width / 2, rand_mean, width, yerr=rand_std, label="Random (mean)", color="salmon", capsize=3)
+    ax.set_xticks(x)
+    ax.set_xticklabels(types_sorted)
+    ax.set_xlabel("Transform type")
+    ax.set_ylabel("Count")
+    ax.set_title("Transform Types Selected by Search")
+    ax.legend()
+    ax.grid(True, alpha=0.3, axis="y")
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"Saved transform types plot to {save_path}")
+
+
 def save_results(results: dict, output_dir: str):
     """Save search results as JSON."""
     os.makedirs(output_dir, exist_ok=True)
