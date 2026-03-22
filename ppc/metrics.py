@@ -186,6 +186,7 @@ def task_residual(
     flat = state.flat
     blocks = []
     for t in graph.transforms:
+
         def _fwd(flat_single, _t=t):
             srcs = []
             for s in _t.src:

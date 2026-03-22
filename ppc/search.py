@@ -40,7 +40,7 @@ class SearchConfig:
     T: int = 20
     infer_iters: int = 30
     infer_lr: float = 0.05
-    eps: float = 1e-4          # ridge parameter for M
+    eps: float = 1e-4  # ridge parameter for M
     prune_fraction: float = 0.2  # ρ — fraction to remove per round
     score_tolerance: float = 0.1  # δ — max φ_T increase over full
 
@@ -53,6 +53,7 @@ class SearchConfig:
 @dataclass
 class Candidate:
     """A potential edge to add to the supergraph."""
+
     name: str
     transform_factory: Callable[[jax.Array], Transform]
     energy_factory: Callable[[str], Energy]
@@ -122,16 +123,20 @@ def reduce(
     phi_full = float(jnp.mean(d["phi_T_predicted"]))
     batch_size = state.flat.shape[0]
 
-    print(f"  Full graph: {len(graph.transforms)} edges, φ_T={phi_full:.4f}, "
-          f"eff_rank={d['effective_rank']}")
+    print(
+        f"  Full graph: {len(graph.transforms)} edges, φ_T={phi_full:.4f}, "
+        f"eff_rank={d['effective_rank']}"
+    )
 
     # Track which edges are still active (by index into graph.transforms)
     active = list(range(len(graph.transforms)))
-    history = [{
-        "n_edges": len(active),
-        "phi_T": phi_full,
-        "leverage_scores": {graph.transforms[i].id: scores[i] for i in active},
-    }]
+    history = [
+        {
+            "n_edges": len(active),
+            "phi_T": phi_full,
+            "leverage_scores": {graph.transforms[i].id: scores[i] for i in active},
+        }
+    ]
 
     # Precompute batch-averaged Jacobians (needed for Woodbury downdates)
     jacobians = {}
@@ -173,7 +178,10 @@ def reduce(
         remaining_energies = []
         active_tids = {graph.transforms[i].id for i in active}
         for e in graph.energies:
-            if all(a in active_tids or not any(a == t.id for t in graph.transforms) for a in e.args):
+            if all(
+                a in active_tids or not any(a == t.id for t in graph.transforms)
+                for a in e.args
+            ):
                 remaining_energies.append(e)
 
         try:
@@ -197,9 +205,11 @@ def reduce(
 
         removed_names = [graph.transforms[i].id for i in to_remove]
         round_num += 1
-        print(f"  Round {round_num}: {len(active)} edges, φ_T={phi_reduced:.4f} "
-              f"(Δ={phi_reduced - phi_full:+.4f}), "
-              f"removed: {[n.split('_', 2)[-1] for n in removed_names]}")
+        print(
+            f"  Round {round_num}: {len(active)} edges, φ_T={phi_reduced:.4f} "
+            f"(Δ={phi_reduced - phi_full:+.4f}), "
+            f"removed: {[n.split('_', 2)[-1] for n in removed_names]}"
+        )
 
         h = {
             "n_edges": len(active),
@@ -209,10 +219,13 @@ def reduce(
         }
         history.append(h)
 
-        # Check tolerance
-        if phi_reduced - phi_full > cfg.score_tolerance:
-            print(f"  Score tolerance exceeded (δ={phi_reduced - phi_full:.4f} > {cfg.score_tolerance}), "
-                  f"restoring last batch")
+        # Check tolerance: stop when φ_T increases relative to previous round
+        prev_phi = history[-2]["phi_T"] if len(history) >= 2 else phi_full
+        if phi_reduced > prev_phi + cfg.score_tolerance:
+            print(
+                f"  Score tolerance exceeded (δ={phi_reduced - phi_full:.4f} > {cfg.score_tolerance}), "
+                f"restoring last batch"
+            )
             for i in to_remove:
                 active.append(i)
             active.sort()
@@ -224,7 +237,10 @@ def reduce(
     active_tids = {graph.transforms[i].id for i in active}
     final_energies = []
     for e in graph.energies:
-        if all(a in active_tids or not any(a == t.id for t in graph.transforms) for a in e.args):
+        if all(
+            a in active_tids or not any(a == t.id for t in graph.transforms)
+            for a in e.args
+        ):
             final_energies.append(e)
 
     reduced_graph = Graph(
@@ -267,7 +283,10 @@ def random_reduce(
     kept_tids = {graph.transforms[i].id for i in keep}
     kept_energies = []
     for e in graph.energies:
-        if all(a in kept_tids or not any(a == t.id for t in graph.transforms) for a in e.args):
+        if all(
+            a in kept_tids or not any(a == t.id for t in graph.transforms)
+            for a in e.args
+        ):
             kept_energies.append(e)
 
     reduced = Graph(
