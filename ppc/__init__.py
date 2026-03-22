@@ -18,6 +18,8 @@ from .search import (
     Candidate,
     instantiate_candidate,
     build_supergraph,
+    compute_leverages,
+    select_top_k,
     reduce,
     random_reduce,
 )
