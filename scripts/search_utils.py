@@ -222,6 +222,100 @@ def plot_transform_types(
     print(f"Saved transform types plot to {save_path}")
 
 
+def plot_quick_eval_curve(
+    res_histories: list[dict],
+    rand_histories: list[dict],
+    save_path: str,
+):
+    """Quick-eval accuracy vs search step — THE key diagnostic plot."""
+    fig, ax = plt.subplots(figsize=(8, 5))
+    # Residual-driven trials (individual lines)
+    for i, h in enumerate(res_histories):
+        qe = h.get("quick_eval_acc", [])
+        if qe:
+            label = f"Residual (trial {i+1})" if len(res_histories) > 1 else "Residual-driven"
+            ax.plot(range(len(qe)), qe, "b-o", label=label, linewidth=2, alpha=0.8)
+    # Random trials (mean + std band)
+    if rand_histories:
+        all_qe = [h.get("quick_eval_acc", []) for h in rand_histories]
+        all_qe = [q for q in all_qe if q]
+        if all_qe:
+            max_len = max(len(q) for q in all_qe)
+            padded = np.full((len(all_qe), max_len), np.nan)
+            for i, q in enumerate(all_qe):
+                padded[i, : len(q)] = q
+            mean = np.nanmean(padded, axis=0)
+            std = np.nanstd(padded, axis=0)
+            steps = range(len(mean))
+            ax.plot(steps, mean, "r--", label="Random (mean)", linewidth=2)
+            ax.fill_between(steps, mean - std, mean + std, alpha=0.2, color="r")
+    ax.set_xlabel("Search step")
+    ax.set_ylabel("Quick-eval accuracy")
+    ax.set_title("Architecture Accuracy During Search")
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim(bottom=0)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"Saved quick-eval curve to {save_path}")
+
+
+def plot_ablation_bars(ablation_results: list[dict], base_acc: float, save_path: str):
+    """Bar chart of accuracy drop when each edge is removed."""
+    if not ablation_results:
+        return
+    fig, ax = plt.subplots(figsize=(10, 5))
+    names = [r["edge"].split("_", 2)[-1] for r in ablation_results]  # short names
+    drops = [r["acc_drop"] for r in ablation_results]
+    colors = ["firebrick" if d > 0.01 else "gray" for d in drops]
+    ax.bar(range(len(names)), drops, color=colors)
+    ax.set_xticks(range(len(names)))
+    ax.set_xticklabels(names, rotation=45, ha="right", fontsize=7)
+    ax.set_ylabel("Accuracy drop when removed")
+    ax.set_title(f"Edge Ablation (base accuracy: {base_acc:.4f})")
+    ax.axhline(y=0, color="gray", linestyle=":", alpha=0.5)
+    ax.grid(True, alpha=0.3, axis="y")
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"Saved ablation plot to {save_path}")
+
+
+def plot_accuracy_boxplot(
+    res_accs: list[float],
+    rand_accs: list[float],
+    save_path: str,
+):
+    """Box plot comparing final accuracy distributions."""
+    fig, ax = plt.subplots(figsize=(6, 5))
+    data = [res_accs, rand_accs]
+    bp = ax.boxplot(data, labels=["Residual-driven", "Random"], patch_artist=True,
+                    widths=0.5)
+    bp["boxes"][0].set_facecolor("steelblue")
+    bp["boxes"][0].set_alpha(0.7)
+    bp["boxes"][1].set_facecolor("salmon")
+    bp["boxes"][1].set_alpha(0.7)
+    # Overlay individual points
+    for i, pts in enumerate(data):
+        jitter = np.random.default_rng(0).uniform(-0.1, 0.1, len(pts))
+        ax.scatter([i + 1 + j for j in jitter], pts, color="black", s=30, zorder=5, alpha=0.7)
+    ax.set_ylabel("Test accuracy")
+    ax.set_title("Final Accuracy: Residual-Driven vs Random")
+    ax.grid(True, alpha=0.3, axis="y")
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"Saved accuracy boxplot to {save_path}")
+
+
+def print_architecture(transforms, label="Architecture"):
+    """Print discovered architecture as text adjacency list."""
+    print(f"\n  {label} ({len(transforms)} edges):")
+    for t in transforms:
+        print(f"    {t.id}")
+
+
 def save_results(results: dict, output_dir: str):
     """Save search results as JSON."""
     os.makedirs(output_dir, exist_ok=True)

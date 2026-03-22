@@ -273,6 +273,68 @@ def candidate_novelty(
     return float(jnp.sum(J_perp**2))
 
 
+def woodbury_gain(
+    graph: Graph,
+    state: State,
+    transform_obj: Transform,
+    decomp: dict,
+    eps: float = 1e-4,
+) -> float:
+    """Matching pursuit gain for a candidate edge via Woodbury (paper eq. 8).
+
+    Measures how much the candidate's new Jacobian directions reduce the
+    state-space residual from the coverage gap.  Cost: one forward pass
+    of the candidate transform (no graph rebuild or inference).
+
+    For a candidate adding low-rank update J_c^T J_c to the precision matrix:
+        Δ = trace( J_c M^{-1} g g^T M^{-1} J_c^T (I + J_c M^{-1} J_c^T)^{-1} )
+    where M = Γ + εI and g = A^T b is the state-space residual gradient.
+
+    Returns scalar gain >= 0 (higher = candidate aligns more with residual).
+    """
+    # Current precision matrix eigendecomposition
+    eigenvalues = decomp["eigenvalues"]  # (rank,)
+    eigenvectors = decomp["eigenvectors"]  # (D, rank)
+
+    # Regularised precision inverse in eigenbasis: M^{-1} = U diag(1/(λ+ε)) U^T
+    inv_eigs = 1.0 / (eigenvalues + eps)  # (rank,)
+
+    # State-space residual: g = A^T b (averaged over batch)
+    # From decompose: b = task_residual, A = weighted_jacobian
+    # g = A^T b = U Σ V^T b; in eigenbasis: g_eig = Σ * (V^T b) = Σ * coefficients
+    # But we need full g including null-space components.
+    # Actually: A^T b_perp = 0, so g = A^T b_par = A^T V c where c = coefficients.
+    # In eigenbasis of Γ: g_eig_i = σ_i * c_i where σ_i = sqrt(λ_i).
+    coefficients = jnp.mean(decomp["coefficients"], axis=0)  # (rank,) batch-averaged
+    sigma = jnp.sqrt(eigenvalues)
+    g_eig = sigma * coefficients  # (rank,)
+
+    # Candidate Jacobian (batch-averaged)
+    J_c = candidate_jacobian(graph, state, transform_obj)  # (B, d_c, D)
+    J_c_avg = jnp.mean(J_c, axis=0)  # (d_c, D)
+
+    # Project J_c into eigenbasis: J_c_eig = J_c @ U, shape (d_c, rank)
+    J_c_eig = J_c_avg @ eigenvectors  # (d_c, rank)
+
+    # J_c M^{-1} J_c^T: (d_c, d_c)
+    S = J_c_eig * inv_eigs[None, :]  # (d_c, rank)
+    JMJ = S @ J_c_eig.T  # (d_c, d_c)
+
+    # (I + J_c M^{-1} J_c^T)^{-1}
+    inner = jnp.eye(J_c_avg.shape[0]) + JMJ
+    inner_inv = jnp.linalg.inv(inner)  # (d_c, d_c)
+
+    # M^{-1} g in eigenbasis
+    M_inv_g = inv_eigs * g_eig  # (rank,)
+
+    # J_c M^{-1} g: (d_c,)
+    v = J_c_eig @ M_inv_g  # (d_c,)
+
+    # Full Woodbury gain: v^T (I + JMJ)^{-1} v
+    gain = float(v @ inner_inv @ v)
+    return gain
+
+
 def score(
     graph: Graph,
     state: State,

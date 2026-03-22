@@ -24,6 +24,7 @@ from .metrics import (
     score,
     candidate_jacobian,
     candidate_novelty,
+    woodbury_gain,
 )
 
 __all__ = [
@@ -54,4 +55,5 @@ __all__ = [
     "expand_state",
     "candidate_jacobian",
     "candidate_novelty",
+    "woodbury_gain",
 ]
