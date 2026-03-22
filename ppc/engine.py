@@ -1,4 +1,4 @@
-"""Functional engine: init, infer, energy, state_grad, param_grad, variable, transform, prediction."""
+"""Functional engine: init, infer, energy, state_grad, param_grad, variable, predict."""
 
 from __future__ import annotations
 
@@ -39,7 +39,7 @@ def init(
 
 
 # ---------------------------------------------------------------------------
-# Predict (internal) — returns dict keyed by target var name
+# Predict
 # ---------------------------------------------------------------------------
 
 
@@ -56,17 +56,13 @@ def predict(graph: Graph, flat: jax.Array) -> dict[str, jax.Array]:
         for si in range(bucket.meta.n_srcs):
             src_shape = bucket.meta.src_shapes[si]
             if bucket.meta.shared_srcs[si]:
-                # All edges read the same source — gather once, broadcast via vmap
                 idx = jnp.array(bucket.gather_indices[si][0])
-                gathered = flat[:, idx]  # (batch, size)
-                gathered = gathered.reshape(batch, *src_shape)
+                gathered = flat[:, idx].reshape(batch, *src_shape)
                 sources.append(gathered)
                 src_in_axes.append(None)
             else:
-                # Each edge reads a different source — fancy indexing
                 idx = jnp.array(bucket.gather_indices[si])
-                gathered = flat[:, idx]
-                gathered = gathered.reshape(batch, n_edges, *src_shape)
+                gathered = flat[:, idx].reshape(batch, n_edges, *src_shape)
                 sources.append(gathered.transpose(1, 0, *range(2, gathered.ndim)))
                 src_in_axes.append(0)
 
@@ -182,39 +178,3 @@ def variable(graph: Graph, state: State, name: str) -> jax.Array:
     layout = graph.layout
     o, s, sh = layout.offsets[name], layout.sizes[name], layout.shapes[name]
     return state.flat[:, o : o + s].reshape(state.flat.shape[0], *sh)
-
-
-def transform(graph: Graph, name: str) -> eqx.Module:
-    """Extract a transform's module by ID."""
-    for t in graph.transforms:
-        if t.id == name:
-            return t.module
-    raise KeyError(f"Transform '{name}' not found")
-
-
-def expand_state(
-    old_graph: Graph,
-    new_graph: Graph,
-    state: State,
-    *,
-    key: jax.Array,
-) -> State:
-    """Expand a State to match a larger Graph's layout, preserving existing values."""
-    batch = state.flat.shape[0]
-    new_layout = new_graph.layout
-    new_flat = 0.1 * jax.random.normal(key, (batch, new_layout.total_dim))
-    new_free_mask = jnp.ones(new_layout.total_dim)
-
-    old_layout = old_graph.layout
-    for v in old_graph.variables:
-        old_o, old_s = old_layout.offsets[v.name], old_layout.sizes[v.name]
-        new_o = new_layout.offsets[v.name]
-        new_flat = new_flat.at[:, new_o : new_o + old_s].set(
-            state.flat[:, old_o : old_o + old_s]
-        )
-        # Preserve clamped status
-        new_free_mask = new_free_mask.at[new_o : new_o + old_s].set(
-            state.free_mask[old_o : old_o + old_s]
-        )
-
-    return State(flat=new_flat, free_mask=new_free_mask)

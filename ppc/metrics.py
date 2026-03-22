@@ -1,7 +1,8 @@
-"""Inference precision matrix metrics: Jacobians, eigenspectra, coverage/conditioning decomposition.
+"""Inference precision matrix metrics and leverage-score reduction.
 
 Γ_G = Σ_e J_e^T Λ_e J_e   (inference precision matrix)
 φ_T = ||b_⊥||² + Σ (1-ηλ_i)^{2T} c_i²   (coverage gap + conditioning penalty)
+ℓ_e = tr(Λ_e J_e M⁻¹ J_eᵀ)   (per-edge leverage score)
 """
 
 from __future__ import annotations
@@ -12,7 +13,7 @@ import jax
 import jax.numpy as jnp
 
 from .graph import Graph
-from .types import State, Transform
+from .types import State
 
 
 # ---------------------------------------------------------------------------
@@ -23,9 +24,6 @@ from .types import State, Transform
 def edge_jacobian(graph: Graph, state: State, transform_idx: int) -> jax.Array:
     """Jacobian of the residual (pred - target) for a single edge w.r.t. flat state.
 
-    The residual is r_e = f_e(x_src) - x_tgt.  Its Jacobian includes both the
-    transform contribution (df_e/dx) and the target variable contribution (-I_tgt).
-    Columns for clamped variables are zeroed (Jacobian is w.r.t. free states only).
     Returns shape (B, d_tgt, D).
     """
     t = graph.transforms[transform_idx]
@@ -60,22 +58,19 @@ def weighted_jacobian(
     """Weighted state Jacobian A_G = [Λ_1^{1/2} J_1; ...; Λ_M^{1/2} J_M].
 
     Shape (B, m, D) where m = Σ d_tgt(e).
-    curvatures: optional {transform_id: Λ_e} (full curvature matrix, not sqrt).
-    Default (None) means Λ=I (MSE energy).
     """
     blocks = []
     for i, t in enumerate(graph.transforms):
         J = edge_jacobian(graph, state, i)
         if curvatures is not None and t.id in curvatures:
-            # Cholesky: Λ = L L^T, so L^T is the square-root factor: (L^T)^T (L^T) = Λ
             L = jnp.linalg.cholesky(curvatures[t.id])
-            J = jnp.einsum("ji,bjk->bik", L, J)  # L^T @ J
+            J = jnp.einsum("ji,bjk->bik", L, J)
         blocks.append(J)
     return jnp.concatenate(blocks, axis=1)
 
 
 # ---------------------------------------------------------------------------
-# Precision matrix
+# Precision matrix and its inverse
 # ---------------------------------------------------------------------------
 
 
@@ -105,22 +100,79 @@ def precision_matrix(
     return sum(edge_precision(graph, state, curvatures))  # type: ignore
 
 
-def eigendecompose(
+def precision_inverse(
     graph: Graph,
     state: State,
+    eps: float = 1e-4,
     curvatures: dict[str, jax.Array] | None = None,
-) -> tuple[jax.Array, jax.Array]:
-    """Eigenvalues and eigenvectors of precision matrix, sorted descending.
-
-    Returns (eigenvalues (D,), eigenvectors (D, D)) where columns are eigenvectors.
-    """
+) -> jax.Array:
+    """M⁻¹ = (Γ + εI)⁻¹. Shape (D, D). Computed once, used for all leverage scores."""
     G = precision_matrix(graph, state, curvatures)
-    vals, vecs = jnp.linalg.eigh(G)
-    return vals[::-1], vecs[:, ::-1]
+    D = G.shape[0]
+    M = G + eps * jnp.eye(D)
+    return jnp.linalg.inv(M)
 
 
 # ---------------------------------------------------------------------------
-# Task residual and decomposition
+# Leverage scores (Section 3.2 of paper)
+# ---------------------------------------------------------------------------
+
+
+def leverage_scores(
+    graph: Graph,
+    state: State,
+    M_inv: jax.Array,
+    curvatures: dict[str, jax.Array] | None = None,
+) -> list[float]:
+    """Per-edge leverage scores: ℓ_e = tr(Λ_e J_e M⁻¹ J_eᵀ).
+
+    High leverage = edge contributes unique directions to the column space.
+    Low leverage = edge is redundant (other edges already cover its directions).
+
+    M_inv: precomputed (D, D) from precision_inverse().
+    Returns one float per edge.
+    """
+    scores = []
+    for i, t in enumerate(graph.transforms):
+        J = edge_jacobian(graph, state, i)
+        J_avg = jnp.mean(J, axis=0)  # (d_tgt, D)
+        if curvatures is not None and t.id in curvatures:
+            # ℓ_e = tr(Λ_e J_e M⁻¹ J_eᵀ)
+            A = J_avg @ M_inv  # (d_tgt, D)
+            B = A @ J_avg.T  # (d_tgt, d_tgt)
+            ell = float(jnp.trace(curvatures[t.id] @ B))
+        else:
+            # Λ_e = I: ℓ_e = tr(J_e M⁻¹ J_eᵀ)
+            A = J_avg @ M_inv  # (d_tgt, D)
+            ell = float(jnp.sum(A * J_avg))  # tr(A J^T) = sum(A ⊙ J)
+        scores.append(ell)
+    return scores
+
+
+def woodbury_downdate(
+    M_inv: jax.Array,
+    J_e: jax.Array,
+    Lambda_e_inv: jax.Array | None = None,
+) -> jax.Array:
+    """Update M⁻¹ after removing edge e's PSD contribution.
+
+    (M - J_eᵀ Λ_e J_e)⁻¹ = M⁻¹ + M⁻¹ J_eᵀ (Λ_e⁻¹ - J_e M⁻¹ J_eᵀ)⁻¹ J_e M⁻¹
+
+    J_e: (d_tgt, D) batch-averaged Jacobian.
+    Lambda_e_inv: (d_tgt, d_tgt) inverse curvature, or None for Λ=I.
+    Returns updated M⁻¹ of shape (D, D).
+    """
+    d = J_e.shape[0]
+    A = M_inv @ J_e.T  # (D, d_tgt)
+    JMJ = J_e @ A  # (d_tgt, d_tgt)
+    if Lambda_e_inv is None:
+        Lambda_e_inv = jnp.eye(d)
+    S = jnp.linalg.inv(Lambda_e_inv - JMJ)  # (d_tgt, d_tgt)
+    return M_inv + A @ S @ A.T
+
+
+# ---------------------------------------------------------------------------
+# Task residual and spectral decomposition
 # ---------------------------------------------------------------------------
 
 
@@ -129,15 +181,11 @@ def task_residual(
     state: State,
     curvatures: dict[str, jax.Array] | None = None,
 ) -> jax.Array:
-    """Stacked curvature-weighted prediction errors: Λ_e^{1/2}(f_e(x_src) - x_tgt).
-
-    Shape (B, m) where m = Σ d_tgt(e).
-    """
+    """Stacked curvature-weighted prediction errors. Shape (B, m)."""
     layout = graph.layout
     flat = state.flat
     blocks = []
     for t in graph.transforms:
-
         def _fwd(flat_single, _t=t):
             srcs = []
             for s in _t.src:
@@ -157,7 +205,7 @@ def task_residual(
         err = pred - tgt
         if curvatures is not None and t.id in curvatures:
             L = jnp.linalg.cholesky(curvatures[t.id])
-            err = jnp.einsum("ji,bj->bi", L, err)  # L^T @ err
+            err = jnp.einsum("ji,bj->bi", L, err)
         blocks.append(err)
     return jnp.concatenate(blocks, axis=1)
 
@@ -172,37 +220,24 @@ def decompose(
     """Full spectral decomposition of the profiled energy.
 
     φ_T = ||b_⊥||² + Σ (1 − ηλ_i)^{2T} c_i²
-        = coverage_gap + conditioning_penalty
-
-    Returns dict with eigenvalues, eigenvectors, per-example coverage gap,
-    conditioning penalty, predicted φ_T, spectral filter, and effective rank.
     """
-    A = weighted_jacobian(graph, state, curvatures)  # (B, m, D)
-    A_avg = jnp.mean(A, axis=0)  # (m, D)
+    A = weighted_jacobian(graph, state, curvatures)
+    A_avg = jnp.mean(A, axis=0)
 
-    # SVD of batch-averaged weighted Jacobian
     V_full, sigma_full, Ut_full = jnp.linalg.svd(A_avg, full_matrices=False)
-
-    # Threshold to actual column-space rank (clamped columns create zero singular values)
     tol = float(sigma_full[0]) * 1e-5 if len(sigma_full) > 0 else 0.0
     rank = int(jnp.sum(sigma_full > tol))
-    V = V_full[:, :rank]  # (m, rank) — column-space basis
-    eigenvalues = sigma_full[:rank] ** 2  # precision matrix eigenvalues
-    eigenvectors = Ut_full[:rank, :].T  # (D, rank) — eigenvectors
+    V = V_full[:, :rank]
+    eigenvalues = sigma_full[:rank] ** 2
+    eigenvectors = Ut_full[:rank, :].T
 
-    # Task residual
-    b = task_residual(graph, state, curvatures)  # (B, m)
+    b = task_residual(graph, state, curvatures)
+    c = b @ V
+    b_perp = b - c @ V.T
 
-    # Project b onto column space of A (spanned by columns of V)
-    c = b @ V  # (B, rank)
-    b_perp = b - c @ V.T  # (B, m)
-
-    coverage_gap = jnp.sum(b_perp**2, axis=1)  # (B,)
-
-    # Spectral filter: ((1 - ηλ)²)^T
-    spectral_filter = ((1.0 - eta * eigenvalues) ** 2) ** T  # (rank,)
-    conditioning_penalty = jnp.sum(spectral_filter[None, :] * c**2, axis=1)  # (B,)
-
+    coverage_gap = jnp.sum(b_perp**2, axis=1)
+    spectral_filter = ((1.0 - eta * eigenvalues) ** 2) ** T
+    conditioning_penalty = jnp.sum(spectral_filter[None, :] * c**2, axis=1)
     phi_T_predicted = coverage_gap + conditioning_penalty
 
     gate = 1.0 / (eta * T) if T > 0 else float("inf")
@@ -218,140 +253,4 @@ def decompose(
         "phi_T_predicted": phi_T_predicted,
         "spectral_filter": spectral_filter,
         "effective_rank": effective_rank,
-    }
-
-
-def candidate_jacobian(
-    graph: Graph,
-    state: State,
-    transform_obj: Transform,
-) -> jax.Array:
-    """Jacobian of a candidate transform's residual (pred - tgt) w.r.t. flat state.
-
-    The candidate transform is not in the graph; we use graph.layout for variable
-    offsets. Returns shape (B, d_tgt, D).
-    """
-    layout = graph.layout
-    t = transform_obj
-
-    def residual(flat_single):
-        srcs = []
-        for s in t.src:
-            o, sz, sh = layout.offsets[s], layout.sizes[s], layout.shapes[s]
-            srcs.append(flat_single[o : o + sz].reshape(sh))
-        out = t.module(*srcs)  # type: ignore
-        if isinstance(out, tuple):
-            pred = jnp.concatenate([v.ravel() for v in out])
-        else:
-            pred = out.ravel()
-        tgt_parts = []
-        for n in t.tgt:
-            o, sz = layout.offsets[n], layout.sizes[n]
-            tgt_parts.append(flat_single[o : o + sz])
-        tgt = jnp.concatenate(tgt_parts)
-        return pred - tgt
-
-    J = jax.vmap(jax.jacrev(residual))(state.flat)
-    return J * state.free_mask[None, None, :]
-
-
-def candidate_novelty(
-    decomp: dict,
-    candidate_J: jax.Array,
-) -> float:
-    """Frobenius norm of candidate J projected out of current column space.
-
-    Higher novelty means the candidate adds more new directions.
-    decomp: output of decompose().
-    candidate_J: (B, d_c, D) from candidate_jacobian().
-    """
-    eigvecs = decomp["eigenvectors"]  # (D, rank)
-    J_avg = jnp.mean(candidate_J, axis=0)  # (d_c, D)
-    # Project out existing column space
-    proj = J_avg @ eigvecs  # (d_c, rank)
-    J_perp = J_avg - proj @ eigvecs.T  # (d_c, D)
-    return float(jnp.sum(J_perp**2))
-
-
-def woodbury_gain(
-    graph: Graph,
-    state: State,
-    transform_obj: Transform,
-    decomp: dict,
-    eps: float = 1e-4,
-) -> float:
-    """Matching pursuit gain for a candidate edge via Woodbury (paper eq. 8).
-
-    Measures how much the candidate's new Jacobian directions reduce the
-    state-space residual from the coverage gap.  Cost: one forward pass
-    of the candidate transform (no graph rebuild or inference).
-
-    For a candidate adding low-rank update J_c^T J_c to the precision matrix:
-        Δ = trace( J_c M^{-1} g g^T M^{-1} J_c^T (I + J_c M^{-1} J_c^T)^{-1} )
-    where M = Γ + εI and g = A^T b is the state-space residual gradient.
-
-    Returns scalar gain >= 0 (higher = candidate aligns more with residual).
-    """
-    # Current precision matrix eigendecomposition
-    eigenvalues = decomp["eigenvalues"]  # (rank,)
-    eigenvectors = decomp["eigenvectors"]  # (D, rank)
-
-    # Regularised precision inverse in eigenbasis: M^{-1} = U diag(1/(λ+ε)) U^T
-    inv_eigs = 1.0 / (eigenvalues + eps)  # (rank,)
-
-    # State-space residual: g = A^T b (averaged over batch)
-    # From decompose: b = task_residual, A = weighted_jacobian
-    # g = A^T b = U Σ V^T b; in eigenbasis: g_eig = Σ * (V^T b) = Σ * coefficients
-    # But we need full g including null-space components.
-    # Actually: A^T b_perp = 0, so g = A^T b_par = A^T V c where c = coefficients.
-    # In eigenbasis of Γ: g_eig_i = σ_i * c_i where σ_i = sqrt(λ_i).
-    coefficients = jnp.mean(decomp["coefficients"], axis=0)  # (rank,) batch-averaged
-    sigma = jnp.sqrt(eigenvalues)
-    g_eig = sigma * coefficients  # (rank,)
-
-    # Candidate Jacobian (batch-averaged)
-    J_c = candidate_jacobian(graph, state, transform_obj)  # (B, d_c, D)
-    J_c_avg = jnp.mean(J_c, axis=0)  # (d_c, D)
-
-    # Project J_c into eigenbasis: J_c_eig = J_c @ U, shape (d_c, rank)
-    J_c_eig = J_c_avg @ eigenvectors  # (d_c, rank)
-
-    # J_c M^{-1} J_c^T: (d_c, d_c)
-    S = J_c_eig * inv_eigs[None, :]  # (d_c, rank)
-    JMJ = S @ J_c_eig.T  # (d_c, d_c)
-
-    # (I + J_c M^{-1} J_c^T)^{-1}
-    inner = jnp.eye(J_c_avg.shape[0]) + JMJ
-    inner_inv = jnp.linalg.inv(inner)  # (d_c, d_c)
-
-    # M^{-1} g in eigenbasis
-    M_inv_g = inv_eigs * g_eig  # (rank,)
-
-    # J_c M^{-1} g: (d_c,)
-    v = J_c_eig @ M_inv_g  # (d_c,)
-
-    # Full Woodbury gain: v^T (I + JMJ)^{-1} v
-    gain = float(v @ inner_inv @ v)
-    return gain
-
-
-def score(
-    graph: Graph,
-    state: State,
-    eta: float,
-    T: int,
-    curvatures: dict[str, jax.Array] | None = None,
-) -> dict[str, Any]:
-    """Batch-averaged architecture score summary."""
-    d = decompose(graph, state, eta, T, curvatures)
-    eigs = d["eigenvalues"]
-    nz = eigs[eigs > 1e-10]
-    cond = float(nz[0] / nz[-1]) if len(nz) > 1 else 1.0
-    return {
-        "phi_T_predicted": float(jnp.mean(d["phi_T_predicted"])),
-        "coverage_gap": float(jnp.mean(d["coverage_gap"])),
-        "conditioning_penalty": float(jnp.mean(d["conditioning_penalty"])),
-        "effective_rank": d["effective_rank"],
-        "condition_number": cond,
-        "eigenvalues": eigs,
     }
