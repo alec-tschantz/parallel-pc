@@ -1,44 +1,32 @@
+"""Structure learning via boundary Schur complement backward elimination.
+
+J(S) = tr(Γ_B*(S)^{-1} Σ_task)
+
+No inference simulation. Single forward pass for Jacobians.
+"""
+
 from dataclasses import dataclass
 from typing import Callable
 
 import jax
 import jax.numpy as jnp
-import optax
 
-from .engine import init, infer
+from .engine import init
 from .graph import Graph, expand
 from .metrics import (
-    boundary_residual,
     classify_edges,
-    edge_jacobian,
-    edge_precision,
-    frozen_boundary_phi,
-    leverage_scores,
-    precision_inverse,
-    woodbury_downdate,
+    partition_dims,
+    precompute_edge_data,
+    score_edge_set,
+    score_each_removal,
 )
-from .types import Energy, Transform, State
-
-
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
+from .types import Energy, Transform
 
 
 @dataclass
 class SearchConfig:
-    eta: float = 0.05
-    T: int = 20
-    infer_iters: int = 10
-    infer_lr: float = 0.05
-    eps: float = 1e-4
-    prune_fraction: float = 0.2
-    score_tolerance: float = 0.15  # max fractional φ_T^B increase before stopping
-
-
-# ---------------------------------------------------------------------------
-# Candidate
-# ---------------------------------------------------------------------------
+    eps: float = 1e-4  # ridge regularisation (= 1/ηT spectral gate)
+    delta: float = 0.0  # stopping tolerance (0 = stop when any removal hurts)
 
 
 @dataclass
@@ -54,8 +42,7 @@ def instantiate_candidate(
     t = candidate.transform_factory(key)
     tid = f"t_e{edge_idx}_{candidate.name}"
     t = Transform(tid, t.module, src=t.src, tgt=t.tgt)
-    e = candidate.energy_factory(tid)
-    return t, e
+    return t, candidate.energy_factory(tid)
 
 
 def build_supergraph(
@@ -70,29 +57,14 @@ def build_supergraph(
     return expand(graph, new_transforms=new_t, new_energies=new_e)
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
 def _build_subgraph(graph: Graph, keep_indices: list[int]) -> Graph:
-    """Build Graph keeping only edges at given indices."""
     kept_t = [graph.transforms[i] for i in keep_indices]
     kept_tids = {graph.transforms[i].id for i in keep_indices}
     kept_e = [
-        e
-        for e in graph.energies
-        if all(
-            a in kept_tids or not any(a == t.id for t in graph.transforms)
-            for a in e.args
-        )
+        e for e in graph.energies
+        if all(a in kept_tids or not any(a == t.id for t in graph.transforms) for a in e.args)
     ]
     return Graph(variables=list(graph.variables), transforms=kept_t, energies=kept_e)
-
-
-# ---------------------------------------------------------------------------
-# Reduce (Algorithm 1)
-# ---------------------------------------------------------------------------
 
 
 def reduce(
@@ -101,202 +73,80 @@ def reduce(
     cfg: SearchConfig,
     key: jax.Array,
 ) -> tuple[Graph, dict]:
-    """Boundary-evaluated leverage reduction with frozen driving force.
+    """Backward elimination via boundary Schur complement.
 
-    1. Run inference on full supergraph
-    2. Classify edges → boundary (kept) + internal (prunable)
-    3. Freeze: boundary residual b_B, Jacobians, driving force d = A^T b
-    4. Compute M⁻¹ once
-    5. Iteratively prune lowest-leverage internal edges
-    6. Stop when frozen φ_T^B increases by > δ
+    Single forward pass → Jacobians → iteratively remove internal edges
+    that least increase the score. Stops when every removal exceeds tolerance.
 
     Returns (reduced_graph, diagnostics).
     """
-    optimizer = optax.adam(cfg.infer_lr)
+    # Linearisation point: initial state (no inference)
+    state = init(graph, clamps, key=key)
 
-    # Step 1: inference on full supergraph
-    key, ik = jax.random.split(key)
-    state = init(graph, clamps, key=ik)
-    state = infer(graph, state, optimizer=optimizer, iters=cfg.infer_iters)
-
-    # Step 2: classify edges
+    # Precompute all Jacobians and residuals (single forward pass)
+    all_J, all_r = precompute_edge_data(graph, state)
     edges = classify_edges(graph, state)
     boundary_idx = edges["boundary"]
     internal_idx = edges["internal"]
-    print(f"  Edges: {len(boundary_idx)} boundary, {len(internal_idx)} internal")
 
-    # Step 3: freeze boundary residual and compute driving force
-    b_B = boundary_residual(graph, state)  # (B, m_B)
+    B_dims, I_dims = partition_dims(graph, state, boundary_idx)
+    D_B, D_I = len(B_dims), len(I_dims)
+    print(f"  {len(boundary_idx)} boundary, {len(internal_idx)} internal edges  "
+          f"(D_B={D_B}, D_I={D_I})")
 
-    # Boundary Jacobian (batch-averaged)
-    A_B_blocks = []
-    for i in boundary_idx:
-        J = edge_jacobian(graph, state, i)
-        A_B_blocks.append(jnp.mean(J, axis=0))
-    A_B = (
-        jnp.concatenate(A_B_blocks, axis=0)
-        if A_B_blocks
-        else jnp.zeros((0, state.flat.shape[1]))
-    )
+    # Score full graph
+    active = list(range(len(graph.transforms)))
+    internal = list(internal_idx)
+    result = score_edge_set(all_J, all_r, boundary_idx, active, B_dims, I_dims, cfg.eps)
+    current_score = result["score"]
 
-    # Full weighted Jacobian for driving force
-    all_J = {}
-    for i in range(len(graph.transforms)):
-        J = edge_jacobian(graph, state, i)
-        all_J[i] = jnp.mean(J, axis=0)  # (d_tgt, D)
+    history = [{"n_edges": len(active), "score": current_score, "removed": None}]
+    pruned_order = []
+    print(f"  Full graph: score={current_score:.6f}")
 
-    # Full A (batch-averaged)
-    A_full = jnp.concatenate([all_J[i] for i in range(len(graph.transforms))], axis=0)
-    b_full = jnp.mean(
-        jnp.concatenate(
-            [edge_jacobian(graph, state, i) for i in range(len(graph.transforms))],
-            axis=1,
-        ),
-        axis=0,
-    )  # Hmm, this is A, not b. Let me compute d = A^T b properly.
-
-    # Actually: d_frozen = Σ_e J_e^T r_e (state-space driving force)
-    # This is the gradient of energy w.r.t. state, which equals A^T b
-    # where b is the task residual. Let's compute it directly.
-    from .engine import state_grad
-
-    d_frozen = jnp.mean(state_grad(graph, state), axis=0)  # (D,) batch-averaged
-    # Note: state_grad includes the free_mask, so d_frozen is already masked.
-    # But for the frozen-RHS computation we want the unmasked gradient.
-    # Actually d_frozen should be the driving force BEFORE masking.
-    # d = A^T b where A is the weighted Jacobian and b is the task residual.
-    # Let's compute it properly:
-    from .metrics import task_residual
-
-    b_all = jnp.mean(task_residual(graph, state), axis=0)  # (m,)
-    d_frozen = A_full.T @ b_all  # (D,)
-
-    # Step 4: M⁻¹
-    M_inv = precision_inverse(graph, state, eps=cfg.eps)
-
-    # Step 5: initial φ_T^B (exact, frozen RHS)
-    Gamma_full = sum(all_J[i].T @ all_J[i] for i in range(len(graph.transforms)))
-    phi_init = frozen_boundary_phi(Gamma_full, b_B, A_B, d_frozen, cfg.eta, cfg.T)  # type: ignore
-    phi_prev = phi_init["phi_T_B"]
-
-    print(
-        f"  Full: {len(graph.transforms)} edges, φ_T^B={phi_prev:.4f}, "
-        f"cov_gap={phi_init['coverage_gap']:.4f}, cond_pen={phi_init['conditioning_penalty']:.4f}"
-    )
-
-    # Track active internal edges
-    active_internal = list(internal_idx)
-    history = [
-        {
-            "n_internal": len(active_internal),
-            "n_total": len(boundary_idx) + len(active_internal),
-            **phi_init,
-        }
-    ]
-
-    # Step 6: iterative pruning
-    round_num = 0
-    while active_internal:
-        # Compute task-aware leverage for active internal edges
-        levs = leverage_scores(graph, state, M_inv, active_internal, A_B=A_B, b_B=b_B)
-
-        # Sort ascending
-        sorted_edges = sorted(active_internal, key=lambda i: levs[i])
-
-        # Remove bottom ρ fraction
-        n_prune = max(1, int(len(active_internal) * cfg.prune_fraction))
-        to_remove = sorted_edges[:n_prune]
-
-        # Woodbury downdates
-        for ei in to_remove:
-            M_inv = woodbury_downdate(M_inv, all_J[ei])
-            active_internal.remove(ei)
-
-        # Compute reduced Gamma from remaining edges
-        active_all = sorted(boundary_idx + active_internal)
-        Gamma_reduced = (
-            sum(all_J[i].T @ all_J[i] for i in active_all)
-            if active_all
-            else jnp.zeros_like(Gamma_full)
+    # Backward elimination
+    while internal:
+        removal_scores = score_each_removal(
+            all_J, all_r, boundary_idx, active, internal, B_dims, I_dims, cfg.eps
         )
 
-        # Exact φ_T^B with frozen RHS
-        phi_result = frozen_boundary_phi(
-            Gamma_reduced, b_B, A_B, d_frozen, cfg.eta, cfg.T  # type: ignore
-        )
-        phi_curr = phi_result["phi_T_B"]
+        best_e = min(internal, key=lambda e: removal_scores[e])
+        best_score = removal_scores[best_e]
+        delta = best_score - current_score
 
-        round_num += 1
-        removed_names = [graph.transforms[i].id.split("_", 2)[-1] for i in to_remove]
-        delta = phi_curr - phi_prev
-        print(
-            f"  Round {round_num}: {len(active_internal)} internal, "
-            f"φ_T^B={phi_curr:.4f} (Δ={delta:+.4f}), "
-            f"removed: {removed_names}"
-        )
-
-        h = {
-            "n_internal": len(active_internal),
-            "n_total": len(boundary_idx) + len(active_internal),
-            "removed": [graph.transforms[i].id for i in to_remove],
-            "leverages": {graph.transforms[i].id: levs[i] for i in to_remove},
-            **phi_result,
-        }
-        history.append(h)
-
-        # Monotonicity check
-        if delta < -1e-6:
-            print(
-                f"  WARNING: φ_T^B decreased by {-delta:.6f} — monotonicity violated!"
-            )
-
-        # Stopping criterion: cumulative increase exceeds fraction of initial φ_T^B
-        if (phi_curr - phi_init["phi_T_B"]) / max(
-            phi_init["phi_T_B"], 1e-6
-        ) > cfg.score_tolerance:
-            frac = (phi_curr - phi_init["phi_T_B"]) / max(phi_init["phi_T_B"], 1e-6)
-            print(
-                f"  Tolerance exceeded (cumulative={frac:.1%} > {cfg.score_tolerance:.0%}), restoring"
-            )
-            for i in to_remove:
-                active_internal.append(i)
-            active_internal.sort()
-            history.pop()
+        if delta > cfg.delta + 1e-10:
+            print(f"  Stop: best removal Δ={delta:+.6f} > δ={cfg.delta}  "
+                  f"({len(internal)} internal remain)")
             break
 
-        phi_prev = phi_curr
+        name = graph.transforms[best_e].id
+        active.remove(best_e)
+        internal.remove(best_e)
+        pruned_order.append(best_e)
+        current_score = best_score
 
-    # Build final graph
-    final_indices = sorted(boundary_idx + active_internal)
-    final_graph = _build_subgraph(graph, final_indices)
+        history.append({
+            "n_edges": len(active),
+            "score": current_score,
+            "removed": best_e,
+            "removed_name": name,
+            "delta": delta,
+        })
+        print(f"  Remove {name}: score={current_score:.6f} (Δ={delta:+.6f}), "
+              f"{len(internal)} internal left")
 
-    # Final leverage scores for surviving internal edges
-    final_levs = (
-        leverage_scores(graph, state, M_inv, active_internal, A_B=A_B, b_B=b_B)
-        if active_internal
-        else {}
-    )
-
-    return final_graph, {
+    return _build_subgraph(graph, active), {
         "history": history,
         "n_boundary": len(boundary_idx),
         "n_internal_start": len(internal_idx),
-        "n_internal_final": len(active_internal),
-        "boundary_edges": [graph.transforms[i].id for i in boundary_idx],
-        "final_internal": [graph.transforms[i].id for i in active_internal],
-        "final_leverage": {
-            graph.transforms[i].id: final_levs.get(i, 0) for i in active_internal
-        },
+        "n_internal_final": len(internal),
+        "pruned_order": pruned_order,
+        "final_edges": [graph.transforms[i].id for i in active],
     }
 
 
-# ---------------------------------------------------------------------------
-# Random pruning baseline (internal edges only)
-# ---------------------------------------------------------------------------
-
-
 def random_reduce(
-    graph: Graph, state: State, n_keep_internal: int, key: jax.Array
+    graph: Graph, state, n_keep_internal: int, key: jax.Array,
 ) -> Graph:
     """Randomly keep n_keep_internal internal edges. All boundary edges kept."""
     edges = classify_edges(graph, state)
@@ -304,6 +154,5 @@ def random_reduce(
     if n_keep_internal >= len(internal):
         return graph
     perm = jax.random.permutation(key, len(internal))
-    keep_internal = sorted([internal[int(perm[i])] for i in range(n_keep_internal)])
-    keep_all = sorted(edges["boundary"] + keep_internal)
-    return _build_subgraph(graph, keep_all)
+    keep = sorted([internal[int(perm[i])] for i in range(n_keep_internal)])
+    return _build_subgraph(graph, sorted(edges["boundary"] + keep))

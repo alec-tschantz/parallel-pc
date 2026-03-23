@@ -1,8 +1,9 @@
-"""Inference precision matrix, boundary evaluation, and leverage-score reduction.
+"""Boundary Schur complement scoring for structure learning.
 
-Γ_G = Σ_e J_e^T Λ_e J_e         (inference precision matrix, all edges)
-φ_T^B = ||b_B^⊥||² + Σ (1-ηλ_i)^{2T} c_{B,i}²   (boundary profiled energy)
-ℓ̃_e = tr(J_e M⁻¹ J_eᵀ)         (trace leverage, ranking proxy)
+J(S) = tr(Γ_B*(S)^{-1} Σ_task)
+
+Γ_B* is the Schur complement of the precision matrix on B-type variable
+dimensions after marginalising I-type dimensions. No driving force, no inference.
 """
 
 from __future__ import annotations
@@ -26,30 +27,64 @@ def classify_edges(graph: Graph, state: State) -> dict[str, list[int]]:
 
     Returns {"boundary": [indices], "internal": [indices]}.
     """
-    layout = graph.layout
     free_mask = state.free_mask
+    layout = graph.layout
     boundary, internal = [], []
     for i, t in enumerate(graph.transforms):
         is_boundary = False
         for name in list(t.src) + list(t.tgt):
-            o = layout.offsets[name]
-            if float(free_mask[o]) == 0.0:
+            if float(free_mask[layout.offsets[name]]) == 0.0:
                 is_boundary = True
                 break
-        if is_boundary:
-            boundary.append(i)
-        else:
-            internal.append(i)
+        (boundary if is_boundary else internal).append(i)
     return {"boundary": boundary, "internal": internal}
 
 
 # ---------------------------------------------------------------------------
-# Jacobians
+# Variable partition: B-type vs I-type
+# ---------------------------------------------------------------------------
+
+
+def partition_dims(
+    graph: Graph, state: State, boundary_idx: list[int],
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Partition free variable dimensions into B-type and I-type.
+
+    A free variable is B-type if any boundary edge touches it (src or tgt).
+    A free variable is I-type otherwise.
+
+    Returns (B_dims, I_dims) as sorted index arrays into the flat state buffer.
+    """
+    layout = graph.layout
+    free_mask = state.free_mask
+
+    b_var_names: set[str] = set()
+    for i in boundary_idx:
+        t = graph.transforms[i]
+        for name in list(t.src) + list(t.tgt):
+            b_var_names.add(name)
+
+    B_dims, I_dims = [], []
+    for v in graph.variables:
+        o, s = layout.offsets[v.name], layout.sizes[v.name]
+        if float(free_mask[o]) == 0.0:
+            continue  # clamped
+        dims = list(range(o, o + s))
+        if v.name in b_var_names:
+            B_dims.extend(dims)
+        else:
+            I_dims.extend(dims)
+
+    return jnp.array(sorted(B_dims), dtype=int), jnp.array(sorted(I_dims), dtype=int)
+
+
+# ---------------------------------------------------------------------------
+# Per-edge data
 # ---------------------------------------------------------------------------
 
 
 def edge_jacobian(graph: Graph, state: State, transform_idx: int) -> jax.Array:
-    """Jacobian of residual (pred - target) for edge w.r.t. flat state. (B, d_tgt, D)."""
+    """Jacobian of residual (tgt - pred) for edge w.r.t. flat state. (B, d_tgt, D)."""
     t = graph.transforms[transform_idx]
     layout = graph.layout
 
@@ -59,275 +94,120 @@ def edge_jacobian(graph: Graph, state: State, transform_idx: int) -> jax.Array:
             o, sz, sh = layout.offsets[s], layout.sizes[s], layout.shapes[s]
             srcs.append(flat_single[o : o + sz].reshape(sh))
         out = t.module(*srcs)  # type: ignore
-        if isinstance(out, tuple):
-            pred = jnp.concatenate([v.ravel() for v in out])
-        else:
-            pred = out.ravel()
-        tgt_parts = []
-        for n in t.tgt:
-            o, sz = layout.offsets[n], layout.sizes[n]
-            tgt_parts.append(flat_single[o : o + sz])
-        return (
-            jnp.concatenate(tgt_parts) - pred
-        )  # note: tgt - pred (positive when undershoot)
+        pred = jnp.concatenate([v.ravel() for v in out]) if isinstance(out, tuple) else out.ravel()
+        tgt = jnp.concatenate([flat_single[layout.offsets[n] : layout.offsets[n] + layout.sizes[n]] for n in t.tgt])
+        return tgt - pred
 
     J = jax.vmap(jax.jacrev(residual))(state.flat)
     return J * state.free_mask[None, None, :]
 
 
-# ---------------------------------------------------------------------------
-# Residuals
-# ---------------------------------------------------------------------------
+def precompute_edge_data(
+    graph: Graph, state: State,
+) -> tuple[dict[int, jax.Array], dict[int, jax.Array]]:
+    """Batch-averaged Jacobians and per-sample residuals for all edges.
 
-
-def task_residual(graph: Graph, state: State) -> jax.Array:
-    """Full task residual (all edges). Shape (B, m)."""
-    layout = graph.layout
-    flat = state.flat
-    blocks = []
-    for t in graph.transforms:
-
-        def _fwd(flat_single, _t=t):
-            srcs = []
-            for s in _t.src:
-                o, sz, sh = layout.offsets[s], layout.sizes[s], layout.shapes[s]
-                srcs.append(flat_single[o : o + sz].reshape(sh))
-            out = _t.module(*srcs)  # type: ignore
-            if isinstance(out, tuple):
-                return jnp.concatenate([v.ravel() for v in out])
-            return out.ravel()
-
-        pred = jax.vmap(_fwd)(flat)
-        tgt_parts = [
-            flat[:, layout.offsets[n] : layout.offsets[n] + layout.sizes[n]]
-            for n in t.tgt
-        ]
-        tgt = jnp.concatenate(tgt_parts, axis=1)
-        blocks.append(pred - tgt)
-    return jnp.concatenate(blocks, axis=1)
-
-
-def boundary_residual(graph: Graph, state: State) -> jax.Array:
-    """Task residual restricted to boundary edges. Shape (B, m_B)."""
-    layout = graph.layout
-    flat = state.flat
-    edges = classify_edges(graph, state)
-    blocks = []
-    for i in edges["boundary"]:
-        t = graph.transforms[i]
-
-        def _fwd(flat_single, _t=t):
-            srcs = []
-            for s in _t.src:
-                o, sz, sh = layout.offsets[s], layout.sizes[s], layout.shapes[s]
-                srcs.append(flat_single[o : o + sz].reshape(sh))
-            out = _t.module(*srcs)  # type: ignore
-            if isinstance(out, tuple):
-                return jnp.concatenate([v.ravel() for v in out])
-            return out.ravel()
-
-        pred = jax.vmap(_fwd)(flat)
-        tgt_parts = [
-            flat[:, layout.offsets[n] : layout.offsets[n] + layout.sizes[n]]
-            for n in t.tgt
-        ]
-        tgt = jnp.concatenate(tgt_parts, axis=1)
-        blocks.append(pred - tgt)
-    if not blocks:
-        return jnp.zeros((flat.shape[0], 0))
-    return jnp.concatenate(blocks, axis=1)
-
-
-# ---------------------------------------------------------------------------
-# Precision matrix
-# ---------------------------------------------------------------------------
-
-
-def edge_precision(graph: Graph, state: State) -> list[jax.Array]:
-    """Per-edge PSD contributions J_e^T J_e, each (D, D), averaged over batch."""
-    terms = []
-    for i in range(len(graph.transforms)):
-        J = edge_jacobian(graph, state, i)
-        gram = jnp.einsum("bji,bjk->bik", J, J)
-        terms.append(jnp.mean(gram, axis=0))
-    return terms
-
-
-def precision_matrix(graph: Graph, state: State) -> jax.Array:
-    """Γ = Σ J_e^T J_e. Shape (D, D), batch-averaged."""
-    return sum(edge_precision(graph, state))  # type: ignore
-
-
-def precision_inverse(graph: Graph, state: State, eps: float = 1e-4) -> jax.Array:
-    """M⁻¹ = (Γ + εI)⁻¹. Shape (D, D)."""
-    G = precision_matrix(graph, state)
-    return jnp.linalg.inv(G + eps * jnp.eye(G.shape[0]))
-
-
-# ---------------------------------------------------------------------------
-# Leverage scores (trace proxy for ranking)
-# ---------------------------------------------------------------------------
-
-
-def leverage_scores(
-    graph: Graph,
-    state: State,
-    M_inv: jax.Array,
-    edge_indices: list[int] | None = None,
-    A_B: jax.Array | None = None,
-    b_B: jax.Array | None = None,
-) -> dict[int, float]:
-    """Task-aware leverage: how much edge e helps resolve boundary residual.
-
-    If A_B and b_B are provided, computes task-aware leverage:
-        ℓ̃_e = (1/B) Σ_n ||J_e M⁻¹ A_Bᵀ b_{B,n}||²
-    Otherwise falls back to structural trace leverage:
-        ℓ̃_e = tr(J_e M⁻¹ J_eᵀ)
-
-    Returns {edge_index: leverage}.
+    Returns (all_J, all_r):
+        all_J[e]: (d_tgt, D_full) batch-averaged Jacobian
+        all_r[e]: (N, d_tgt) per-sample residuals
     """
-    if edge_indices is None:
-        edge_indices = list(range(len(graph.transforms)))
+    layout = graph.layout
+    flat = state.flat
+    all_J, all_r = {}, {}
+    for i, t in enumerate(graph.transforms):
+        all_J[i] = jnp.mean(edge_jacobian(graph, state, i), axis=0)
 
-    task_aware = A_B is not None and b_B is not None
-    if task_aware:
-        assert A_B is not None and b_B is not None
-        # Precompute M⁻¹ A_Bᵀ b_B for all samples: (D, B)
-        # b_B: (B, m_B), A_B: (m_B, D)
-        M_inv_AtB = M_inv @ A_B.T @ b_B.T  # (D, B)
+        def _fwd(flat_single, _t=t):
+            srcs = []
+            for s in _t.src:
+                o, sz, sh = layout.offsets[s], layout.sizes[s], layout.shapes[s]
+                srcs.append(flat_single[o : o + sz].reshape(sh))
+            out = _t.module(*srcs)  # type: ignore
+            return jnp.concatenate([v.ravel() for v in out]) if isinstance(out, tuple) else out.ravel()
 
-    scores = {}
-    for i in edge_indices:
-        J = edge_jacobian(graph, state, i)
-        J_avg = jnp.mean(J, axis=0)  # (d_tgt, D)
-        if task_aware:
-            # J_e @ M⁻¹ A_Bᵀ b_B: (d_tgt, B)
-            projected = J_avg @ M_inv_AtB  # (d_tgt, B)
-            scores[i] = float(jnp.mean(jnp.sum(projected**2, axis=0)))
-        else:
-            A = J_avg @ M_inv
-            scores[i] = float(jnp.sum(A * J_avg))
-    return scores
-
-
-def woodbury_downdate(M_inv: jax.Array, J_e: jax.Array) -> jax.Array:
-    """M⁻¹ after removing edge e: (M - J_eᵀ J_e)⁻¹ via Woodbury."""
-    d = J_e.shape[0]
-    A = M_inv @ J_e.T  # (D, d)
-    JMJ = J_e @ A  # (d, d)
-    S = jnp.linalg.inv(jnp.eye(d) - JMJ)  # (d, d)
-    return M_inv + A @ S @ A.T
+        pred = jax.vmap(_fwd)(flat)
+        tgt = jnp.concatenate(
+            [flat[:, layout.offsets[n] : layout.offsets[n] + layout.sizes[n]] for n in t.tgt],
+            axis=1,
+        )
+        all_r[i] = tgt - pred
+    return all_J, all_r
 
 
 # ---------------------------------------------------------------------------
-# Frozen-RHS boundary profiled energy (exact, for stopping criterion)
+# Boundary Schur complement score
 # ---------------------------------------------------------------------------
 
 
-def frozen_boundary_phi(
-    Gamma_reduced: jax.Array,
-    b_B: jax.Array,
-    A_B: jax.Array,
-    d_frozen: jax.Array,
-    eta: float,
-    T: int,
+def score_edge_set(
+    all_J: dict[int, jax.Array],
+    all_r: dict[int, jax.Array],
+    boundary_idx: list[int],
+    edge_set: list[int],
+    B_dims: jnp.ndarray,
+    I_dims: jnp.ndarray,
+    eps: float = 1e-4,
 ) -> dict[str, Any]:
-    """Boundary profiled energy with frozen driving force.
+    """Boundary Schur complement score: J(S) = tr(Γ_B*^{-1} Σ_task).
 
-    Gamma_reduced: (D, D) precision matrix of reduced graph
-    b_B: (B, m_B) boundary residual from full graph (frozen)
-    A_B: (m_B, D) boundary Jacobian (batch-averaged, frozen)
-    d_frozen: (D,) frozen driving force = A^T b (batch-averaged, from full graph)
-    eta, T: inference parameters
+    Γ_B* is the Schur complement on B-dims after marginalising I-dims.
+    Σ_task is the task covariance in B-dim state space, computed from
+    boundary edge driving forces.
 
-    Returns dict with phi_T_B, coverage_gap, conditioning_penalty.
+    Returns dict with score, eigenvalues of Γ_B*.
     """
-    # Eigendecompose reduced Γ
-    eigenvalues, eigenvectors = jnp.linalg.eigh(Gamma_reduced)
-    eigenvalues = jnp.maximum(eigenvalues, 0.0)  # numerical safety
+    D_full = all_J[next(iter(all_J))].shape[1]
+    D_B = len(B_dims)
+    D_I = len(I_dims)
 
-    # Spectral filter g_T(λ) = (1-ηλ)^T applied to frozen driving force
-    # State update: δx = U diag(g_i) U^T d  where g_i = 1 - (1-ηλ_i)^T / ...
-    # Actually: after T steps of GD on quadratic E = ½||Ax-b||²:
-    # x^(T) = U diag(1-(1-ηλ_i)^T) Λ⁻¹ U^T A^T b
-    # = U diag((1-(1-ηλ_i)^T)/λ_i) U^T d_frozen
-    # The remaining residual in boundary space:
-    # b_B^(T) = b_B - A_B δx^(T)
+    # Build Γ_S in full space
+    Gamma = eps * jnp.eye(D_full)
+    for e in edge_set:
+        Gamma = Gamma + all_J[e].T @ all_J[e]
 
-    # Project d_frozen into eigenbasis
-    d_eig = eigenvectors.T @ d_frozen  # (D,)
+    # Extract blocks
+    G_BB = Gamma[jnp.ix_(B_dims, B_dims)]
 
-    # Spectral response: how much of d is resolved along each eigendirection
-    # resolved_i = (1 - (1-ηλ_i)^T) / λ_i * d_eig_i  (for λ_i > 0)
-    # = (1 - (1-ηλ_i)^T) / λ_i * d_eig_i
-    safe_eigs = jnp.maximum(eigenvalues, 1e-10)
-    filter_coeff = (1.0 - (1.0 - eta * eigenvalues) ** T) / safe_eigs
-    filter_coeff = jnp.where(eigenvalues > 1e-10, filter_coeff, 0.0)
+    if D_I == 0:
+        Gamma_B_star = G_BB
+    else:
+        G_BI = Gamma[jnp.ix_(B_dims, I_dims)]
+        G_II = Gamma[jnp.ix_(I_dims, I_dims)]
+        Gamma_B_star = G_BB - G_BI @ jnp.linalg.solve(G_II, G_BI.T)
 
-    # State correction in eigenbasis
-    dx_eig = filter_coeff * d_eig  # (D,)
-    dx = eigenvectors @ dx_eig  # (D,)
+    # Task covariance in B-dim state space:
+    # g_{B,n} = Σ_{e∈boundary} (J_e^T r_{e,n})[B_dims]
+    N = next(iter(all_r.values())).shape[0]
+    g_B = jnp.zeros((N, D_B))
+    for e in boundary_idx:
+        force = all_r[e] @ all_J[e]  # (N, D_full)
+        g_B = g_B + force[:, B_dims]
 
-    # Boundary residual after correction
-    b_B_avg = jnp.mean(b_B, axis=0)  # (m_B,)
-    b_B_corrected = b_B_avg - A_B @ dx  # (m_B,)
+    Sigma_task = (g_B.T @ g_B) / N  # (D_B, D_B)
 
-    phi_T_B = float(jnp.sum(b_B_corrected**2))
+    # Score: tr(Γ_B*^{-1} Σ_task)
+    score = float(jnp.trace(jnp.linalg.solve(Gamma_B_star, Sigma_task)))
 
-    # Decompose into coverage gap + conditioning penalty
-    # Project b_B into col(A_B)
-    U_B, s_B, _ = jnp.linalg.svd(A_B, full_matrices=False)
-    tol = float(s_B[0]) * 1e-5 if len(s_B) > 0 else 0.0
-    rank_B = int(jnp.sum(s_B > tol))
-    V_B = U_B[:, :rank_B]
-    c_B = b_B_avg @ V_B
-    b_B_perp = b_B_avg - c_B @ V_B.T
-    coverage_gap = float(jnp.sum(b_B_perp**2))
-    conditioning_penalty = phi_T_B - coverage_gap
+    eigenvalues = jnp.linalg.eigvalsh(Gamma_B_star)
 
-    return {
-        "phi_T_B": phi_T_B,
-        "coverage_gap": coverage_gap,
-        "conditioning_penalty": conditioning_penalty,
-    }
+    return {"score": score, "eigenvalues": eigenvalues}
 
 
-# ---------------------------------------------------------------------------
-# Full decompose (backwards compat for training evaluation)
-# ---------------------------------------------------------------------------
-
-
-def decompose(graph: Graph, state: State, eta: float, T: int) -> dict[str, Any]:
-    """Full spectral decomposition of profiled energy (all edges)."""
-    # Weighted Jacobian
-    blocks = []
-    for i in range(len(graph.transforms)):
-        blocks.append(edge_jacobian(graph, state, i))
-    A = jnp.mean(jnp.concatenate(blocks, axis=1), axis=0)  # (m, D)
-
-    V_full, sigma_full, Ut_full = jnp.linalg.svd(A, full_matrices=False)
-    tol = float(sigma_full[0]) * 1e-5 if len(sigma_full) > 0 else 0.0
-    rank = int(jnp.sum(sigma_full > tol))
-    V = V_full[:, :rank]
-    eigenvalues = sigma_full[:rank] ** 2
-
-    b = task_residual(graph, state)
-    b_avg = jnp.mean(b, axis=0)
-    c = b_avg @ V
-    b_perp = b_avg - c @ V.T
-
-    coverage_gap = float(jnp.sum(b_perp**2))
-    spectral_filter = ((1.0 - eta * eigenvalues) ** 2) ** T
-    conditioning_penalty = float(jnp.sum(spectral_filter * c**2))
-    phi_T = coverage_gap + conditioning_penalty
-
-    gate = 1.0 / (eta * T) if T > 0 else float("inf")
-    effective_rank = int(jnp.sum(eigenvalues > gate))
-
-    return {
-        "phi_T": phi_T,
-        "coverage_gap": coverage_gap,
-        "conditioning_penalty": conditioning_penalty,
-        "eigenvalues": eigenvalues,
-        "effective_rank": effective_rank,
-    }
+def score_each_removal(
+    all_J: dict[int, jax.Array],
+    all_r: dict[int, jax.Array],
+    boundary_idx: list[int],
+    current_edges: list[int],
+    candidates: list[int],
+    B_dims: jnp.ndarray,
+    I_dims: jnp.ndarray,
+    eps: float = 1e-4,
+) -> dict[int, float]:
+    """Score of S \\ {e} for each candidate e. Returns {edge_idx: score_without}."""
+    scores = {}
+    for e in candidates:
+        reduced = [i for i in current_edges if i != e]
+        scores[e] = score_edge_set(
+            all_J, all_r, boundary_idx, reduced, B_dims, I_dims, eps
+        )["score"]
+    return scores

@@ -4,16 +4,11 @@ from .engine import init, infer, energy, state_grad, param_grad, variable, predi
 from .utils import mse_energy, cross_entropy_energy
 from .metrics import (
     classify_edges,
+    partition_dims,
     edge_jacobian,
-    edge_precision,
-    precision_matrix,
-    precision_inverse,
-    task_residual,
-    boundary_residual,
-    decompose,
-    leverage_scores,
-    woodbury_downdate,
-    frozen_boundary_phi,
+    precompute_edge_data,
+    score_edge_set,
+    score_each_removal,
 )
 from .search import (
     SearchConfig,

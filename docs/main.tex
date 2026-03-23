@@ -37,7 +37,7 @@
 \newcommand{\cB}{\mathcal{B}}
 \newcommand{\cI}{\mathcal{I}}
 
-\title{\bfseries Inference-Aware Structure Learning}
+\title{\bfseries Structure Learning as Precision Matching}
 \author{}
 \date{}
 
@@ -48,13 +48,13 @@
 %═══════════════════════════════════════════════════════════════
 \begin{abstract}
 %═══════════════════════════════════════════════════════════════
-We introduce a structure-learning method for energy-based models that selects graph topology by how well it resolves a task within a finite inference budget.
-The method rests on a single object: the Gauss--Newton precision matrix of inference, which decomposes additively over factor-graph edges.
-We show that the expected boundary residual variance after $T$ inference steps splits into a \emph{coverage gap} (structurally unreachable error) and a \emph{conditioning penalty} (reachable error that inference is too slow to resolve), and that each internal edge's marginal contribution to this score can be read from a single matrix inverse via an analytic Woodbury downdate.
-The algorithm is the structural analogue of Bayesian model reduction: invert the full model once, score every reduced graph analytically.
-The key departure is the objective: where model evidence penalises over-committed capacity (large eigenvalues), our score penalises computationally inaccessible capacity (small eigenvalues below the spectral gate $\lambda \sim 1/\eta T$).
-All edges shape inference dynamics; only data-facing edges define the evaluation target---a separation that makes leverage scores non-negative and pruning monotonically well-posed.
-Applied at random initialisation, the method requires no training, no labels beyond a small probe batch, and returns a graph together with a decomposed certificate of what it can and cannot do.
+We introduce a method for selecting the graph topology of energy-based models at random initialisation, before any training.
+The method scores each candidate graph by how well the \emph{directional structure} of its boundary precision matches the task: the Schur complement of the inference precision matrix, after marginalising internal degrees of freedom, is compared against the empirical task covariance via an A-optimal criterion.
+Because each edge's Jacobian inherits the algebraic structure of its transform type---Fourier eigenvectors for convolutions, isotropic for dense layers, position-averaged for attention---the boundary Schur complement carries a directional signature that is determined by the transform family, not by random weight values.
+The score is low when this directional signature aligns with the principal directions of the task covariance, providing a principled mechanism for selecting transform types: convolutions are preferred on data with structured frequency content, attention on data with positional structure.
+Because the precision matrix decomposes additively over factor-graph edges, internal edges can only \emph{increase} the boundary Schur complement (in the PSD sense), making backward elimination monotonic and well-posed.
+Dead-end edges contribute nothing to the Schur complement and are pruned for free; chain edges propagate precision from input to output; skip connections add direct boundary coupling.
+The algorithm requires no training, no inference simulation, and no driving force---only the Jacobians at a single linearisation point.
 \end{abstract}
 
 %═══════════════════════════════════════════════════════════════
@@ -62,327 +62,291 @@ Applied at random initialisation, the method requires no training, no labels bey
 %═══════════════════════════════════════════════════════════════
 
 Consider any model in which latent variables are adjusted to minimise a sum of local energies before parameters are updated: predictive coding networks~\citep{rao1999predictive,whittington2017approximation}, deep equilibrium models~\citep{bai2019deep}, Hopfield networks~\citep{ramsauer2021hopfield}, factor graphs in probabilistic graphical models~\citep{koller2009pgm}.
-All share a common structure.
 A factor graph $\cG$ connects variables $\bv_i \in \R^{d_i}$, partitioned into clamped data $\by$ and free latent states $\bx \in \R^D$, through parameterised transforms $f_1,\dots,f_M$ with parameters $\btheta$.
-Local energies $\E_i$ penalise discrepancy between each variable and its incoming predictions, giving total energy
-\begin{equation}\label{eq:energy}
-    E(\bx;\btheta,\cG,\by) = \textstyle\sum_i \E_i.
-\end{equation}
-Inference minimises $E$ over $\bx$ with $\btheta$ fixed. Learning adjusts $\btheta$ afterward.
-We address a question that applies both before and after learning: \emph{which edges does this graph actually need?}
+Local energies $\E_i$ penalise prediction discrepancies, giving total energy $E(\bx;\btheta,\cG,\by) = \sum_i \E_i$.
+We address a question that precedes both inference and learning: \emph{which edges does this graph need?}
 
-Because the energy decomposes over factors, so does its Gauss--Newton Hessian with respect to the free states.
-This gives an \textbf{inference precision matrix} $\bm{\Gamma}_\cG = \sum_e \bm{J}_e^\top \bm{\Lambda}_e \bm{J}_e$ that decomposes additively over edges---a classical property of precision matrices on graphical models~\citep{lauritzen1996graphical,minka2001ep}.
-What is new is using this decomposition as the basis for a complete structure-learning algorithm that is the structural analogue of Bayesian model reduction~\citep{friston2018bmr}.
+The energy decomposes over factors, so its Gauss--Newton Hessian decomposes additively over edges, giving an inference precision matrix $\bm{\Gamma}_\cG = \sum_e \bm{J}_e^\top \bm{\Lambda}_e \bm{J}_e$.
+This is a classical object~\citep{lauritzen1996graphical,minka2001ep}.
+What is new is extracting from it a score that measures \emph{how well the directional structure of the graph's boundary precision matches the task}---not how well inference performs with random weights, but whether the transform types chosen for each edge produce precision in directions that align with the data covariance.
 
-Bayesian model reduction (BMR) fits one full model via variational Bayes, then analytically scores every reduced model that differs only in its priors---\emph{invert once, reduce many}~\citep{friston2016group}.
-We apply the same logic to graph structure rather than parameter priors.
-Compute the full supergraph's precision matrix inverse once; then for each candidate edge removal, compute the change in the architecture score analytically via a Woodbury downdate.
-No refitting, no re-running inference.
+The key object is the \textbf{boundary Schur complement}: the effective precision matrix on boundary-connected variables after marginalising internal degrees of freedom.
+This is a property of the graph's Jacobian structure alone---no driving force, no inference simulation, no dependence on the random initial predictions.
+Internal edges contribute to it only through the off-diagonal coupling they create between boundary-connected variables; dead-end edges contribute nothing.
+Because the precision matrix is additive over edges and the Schur complement is monotone in the PSD order, removing an internal edge can only \emph{decrease} the boundary Schur complement, making backward elimination well-posed.
 
-The critical departure from BMR is the \emph{score}.
-BMR optimises variational free energy, whose Occam factor $\frac{1}{2}\log\det(\bm{\Gamma}_\cG)$ penalises large eigenvalues---a model that is statistically over-committed.
-We optimise the \emph{boundary profiled energy}: the prediction error at data-facing edges after $T$ inference steps.
-Its conditioning penalty penalises small eigenvalues---modes that inference cannot resolve within budget.
-These are complementary failure modes controlled by opposite ends of the spectrum.
-For architecture selection, where the question is ``can this graph solve the task in $T$ steps?''\ rather than ``does this graph overfit?'', the spectral gate is the relevant penalty.
+The directional structure of $\bm{\Gamma}_\cB^*$ is not random---it is inherited from the Jacobian algebra of the graph's transforms.
+A convolutional edge imposes Fourier eigenvectors; a dense edge imposes isotropic random eigenvectors; an attention edge imposes position-averaged directions.
+The score measures the alignment between these transform-determined directions and the principal variation directions of the task data.
+This is the mechanism by which the method selects not just topology (which variables to connect) but transform type (how to connect them).
 
-A crucial design choice separates what edges \emph{do} from what they are \emph{scored against}.
-All edges---internal and boundary---contribute to the precision matrix and therefore to the inference dynamics.
-But the score evaluates prediction error only at the \textbf{boundary}: edges where at least one endpoint is clamped to data.
-Internal edges contribute correction capacity but not evaluation error.
-This decoupling ensures that removing an internal edge can only degrade the score (by weakening inference), never artificially improve it (by eliminating the prediction errors it was generating).
-
-The method applies at two points in a model's lifecycle.
-At \textbf{random initialisation}, the precision matrix reflects only topology and transform families---not learned features.
-On a \textbf{pretrained model}, the same algorithm performs post-hoc structural pruning with an inference-aware score.
-We focus on the random-initialisation case throughout, but all results apply identically to pretrained models.
+The boundary Schur complement connects two classical ideas.
+In graphical models, the Schur complement of the precision matrix gives the marginal precision after variable elimination~\citep{lauritzen1996graphical}.
+In Bayesian model reduction~\citep{friston2018bmr}, a full model is inverted once and reduced models are scored analytically.
+Our method applies the same \emph{invert-once-reduce-many} logic, but scores by boundary precision rather than variational free energy, and operates on graph edges rather than parameter priors.
 
 %═══════════════════════════════════════════════════════════════
-\section{The Precision Matrix and the Profiled Energy}\label{sec:score}
+\section{The Boundary Schur Complement}\label{sec:score}
 %═══════════════════════════════════════════════════════════════
 
-\subsection{Construction}\label{sec:construction}
+\subsection{The inference precision matrix}\label{sec:construction}
 
 Linearising each transform $f_e$ around the current state $\bx_0$, the Gauss--Newton approximation to the energy Hessian is (Appendix~\ref{app:hessian}):
 \begin{equation}\label{eq:hessian}
     \nabla^2_{\bx} E \;\approx\; \bm{\Gamma}_\cG \;=\; \sum_e \bm{J}_e^\top \bm{\Lambda}_e\,\bm{J}_e,
 \end{equation}
-where $\bm{J}_e = \partial r_e/\partial\bx \in \R^{d_{\mathrm{tgt}(e)}\times D}$ is the Jacobian of the prediction residual $r_e = f_e(\bv_{\mathrm{src}}) - \bv_{\mathrm{tgt}}$ with respect to the free states, and $\bm{\Lambda}_e \succeq 0$ is the curvature of the local energy at edge $e$.
-The approximation is justified when prediction errors are small relative to transform curvature, or when transforms are close to linear---the standard Gauss--Newton regime.
-Its quality improves as inference reduces residuals (Appendix~\ref{app:hessian}).
+where $\bm{J}_e \in \R^{d_{\mathrm{tgt}(e)}\times D}$ is the Jacobian of the prediction residual with respect to the free states, and $\bm{\Lambda}_e \succeq 0$ is the curvature of the local energy at edge $e$.
+For linear transforms this is exact; for nonlinear transforms it is accurate when prediction errors are small or transforms are near-linear (Appendix~\ref{app:hessian}).
+Each edge contributes a PSD term $\bm{J}_e^\top\bm{\Lambda}_e\bm{J}_e$ to the sum.
 
-The sum runs over \emph{all} edges, both internal and boundary.
-Every edge shapes the inference dynamics through its contribution to $\bm{\Gamma}_\cG$, regardless of whether it appears in the evaluation score.
+\subsection{Partitioning the state space}\label{sec:partition}
 
-Define the \textbf{weighted state Jacobian} by stacking curvature-weighted blocks:
-\begin{equation}\label{eq:AG}
-    \bm{A}_\cG = \begin{bmatrix} \bm{\Lambda}_1^{1/2}\bm{J}_1 \\ \vdots \\ \bm{\Lambda}_M^{1/2}\bm{J}_M \end{bmatrix} \in \R^{m\times D}, \qquad m = \textstyle\sum_e d_{\mathrm{tgt}(e)},
+Partition the $D$ free state dimensions into two groups:
+\begin{itemize}[nosep,leftmargin=2em]
+    \item $B$-dimensions: those belonging to variables touched by at least one boundary edge (an edge with a clamped endpoint).
+    These are the variables that directly interface with observed data.
+    \item $I$-dimensions: those belonging to variables touched only by internal edges.
+    These are purely latent variables with no direct data connection.
+\end{itemize}
+Under this partition, the precision matrix has block structure:
+\begin{equation}\label{eq:block}
+    \bm{\Gamma}_S = \begin{bmatrix} \bm{\Gamma}_{BB} & \bm{\Gamma}_{BI} \\ \bm{\Gamma}_{IB} & \bm{\Gamma}_{II} \end{bmatrix} + \varepsilon\bm{I},
 \end{equation}
-so that $\bm{\Gamma}_\cG = \bm{A}_\cG^\top \bm{A}_\cG$.
-The column space of $\bm{A}_\cG$---the set of constraint-space directions reachable by adjusting free states---is the central object of the analysis.
+where $S$ is the active edge set and $\varepsilon > 0$ provides regularisation.
 
-\subsection{Architecture as preconditioner}\label{sec:preconditioner}
+\subsection{The Schur complement as boundary precision}\label{sec:schur}
 
-The precision matrix is the operator that gradient-based inference iterates against.
-Its eigenspectrum determines which correction directions exist (nonzero eigenvalues), which are resolved quickly (large eigenvalues), and which are resolved slowly or not at all (small or zero eigenvalues).
-Choosing a graph structure is therefore \emph{preconditioner design} for the inference problem: topology determines which directions are available, transform families determine their algebraic structure, and the inference budget $T$ defines a spectral gate separating resolved modes from frozen ones.
-
-\subsection{Boundary evaluation and the profiled energy}\label{sec:decomp}
-
-Let $\cB \subseteq \{1,\dots,M\}$ denote the set of \textbf{boundary edges}---those where at least one endpoint is clamped to data.
-These are the edges whose prediction errors measure the graph's ability to reconcile input with output.
-Internal edges (those connecting only free variables) contribute to inference dynamics but not to the evaluation target.
-
-Define the \textbf{boundary residual} for a single data point by restricting the task residual to boundary edges:
-\begin{equation}\label{eq:boundary_residual}
-    \bb_\cB = \bigl[\bm{\Lambda}_e^{1/2}(f_e(\bv_{\mathrm{src}}) - \bv_{\mathrm{tgt}(e)})\bigr]_{e \in \cB} \in \R^{m_\cB}, \qquad m_\cB = \textstyle\sum_{e\in\cB} d_{\mathrm{tgt}(e)}.
+The \textbf{boundary Schur complement} is the effective precision on $B$-dimensions after marginalising $I$-dimensions:
+\begin{equation}\label{eq:schur}
+    \bm{\Gamma}_\cB^*(S) \;=\; \bm{\Gamma}_{BB} - \bm{\Gamma}_{BI}\,\bm{\Gamma}_{II}^{-1}\,\bm{\Gamma}_{IB}.
 \end{equation}
-The \textbf{boundary profiled energy} is the expected squared boundary residual remaining after $T$ inference steps, averaged over the probe batch:
-\begin{equation}\label{eq:boundary_profiled}
-    J_T(\cG) = \mathbb{E}\!\left[\|\bb_\cB^{(T)}\|^2\right] = \mathrm{tr}\!\Big(\bm{R}_T(\cG)\;\bm{\Sigma}_{\mathrm{task}}\;\bm{R}_T(\cG)^\top\Big),
+In the Gaussian model $p(\bx) \propto \exp(-\frac{1}{2}\bx^\top\bm{\Gamma}_S\bx)$, this is exactly the marginal precision of $\bx_B$~\citep{lauritzen1996graphical}.
+It measures how much information flows from input boundary to output boundary through the graph's internal structure.
+
+The score for edge set $S$ is:
+\begin{equation}\label{eq:score_def}
+    J(S) = \mathrm{tr}\!\Big((\bm{\Gamma}_\cB^*(S))^{-1}\,\bm{\Sigma}_{\mathrm{task}}\Big),
 \end{equation}
-where $\bb_\cB^{(T)}$ is the boundary residual at the state $\bx^{(T)}$ reached by $T$ steps of gradient descent on the \emph{full} energy $E$, $\bm{\Sigma}_{\mathrm{task}} = \mathbb{E}[\bb_\cB\bb_\cB^\top]$ is the empirical covariance of boundary residuals over the probe batch, and $\bm{R}_T(\cG) = \bm{I} - \bm{A}_\cB\,g_T(\bm{\Gamma}_\cG)\,\bm{A}_\cB^\top$ is the finite-step residual operator with spectral filter $g_T(\lambda) = \eta\sum_{t=0}^{T-1}(1-\eta\lambda)^t$.
-Inference uses the full precision matrix; evaluation uses only the boundary.
+where $\bm{\Sigma}_{\mathrm{task}} = \frac{1}{B}\sum_n \bb_{\cB,n}\bb_{\cB,n}^\top$ is the empirical covariance of boundary residuals over the probe batch, and $\bb_{\cB,n}$ stacks the curvature-weighted prediction errors at boundary edges for sample $n$.
+This is an A-optimal design criterion~\citep{pukelsheim2006optimal}: the graph is scored by expected residual variance in the boundary subspace, weighted by the task distribution.
+Lower is better---more boundary precision means less expected residual.
 
-This is an A-optimal design criterion: the graph is scored by its expected residual variance under the task distribution, filtered through a finite inference budget.
-In practice, $J_T(\cG)$ is estimated by averaging per-sample $\|\bb_\cB^{(T)}\|^2$ over the probe batch---a Monte Carlo estimate of the trace that requires no explicit construction of $\bm{\Sigma}_{\mathrm{task}}$.
+The trace has a directional interpretation.
+The eigenvectors of $\bm{\Gamma}_\cB^*$ are inherited from the Jacobian algebra of the graph's transforms: Fourier basis for convolutions, isotropic random for dense layers, position-averaged for attention (Section~\ref{sec:structure}).
+The eigenvectors of $\bm{\Sigma}_{\mathrm{task}}$ reflect the principal variation directions of the data at the boundary.
+The score $J(S)$ is small when these two sets of eigenvectors are well-aligned---when the graph's transforms produce precision in exactly the directions where the task has the most variance.
+This is the mechanism by which the score selects transform types: convolutions are preferred on data with structured frequency content (natural images) because their Fourier precision aligns with the data's frequency covariance; attention is preferred on data with positional structure because its position-averaged precision aligns with positional variation.
 
-Under the same linearisation as Section~\ref{sec:construction}, define the \textbf{boundary Jacobian} $\bm{A}_\cB \in \R^{m_\cB \times D}$ by restricting $\bm{A}_\cG$ to boundary rows.
-For a single data point with boundary residual $\bb_\cB$, the per-sample score decomposes against the full precision matrix $\bm{\Gamma}_\cG$ (which governs inference) and the boundary target $\bb_\cB$ (which defines the task):
+Three properties make this score suitable for structure learning.
+
+\paragraph{No driving force.}
+The score depends only on the precision matrix $\bm{\Gamma}_S$, not on any inference simulation or initial prediction quality.
+At random initialisation, individual edge predictions are random noise, but the \emph{structural} coupling they induce in $\bm{\Gamma}_\cB^*$ is deterministic given the Jacobians.
+The score measures structural capacity, not random-init performance.
+
+\paragraph{Monotonicity.}
+Adding a PSD term to $\bm{\Gamma}_S$ can only increase $\bm{\Gamma}_\cB^*$ in the PSD order (Appendix~\ref{app:monotone}).
+Therefore removing an internal edge can only decrease $\bm{\Gamma}_\cB^*$, which can only increase $J(S)$.
+Backward elimination is well-posed: the score is monotonically non-decreasing as internal edges are removed.
+
+\paragraph{Dead-end insensitivity.}
+An edge $h_i \to d_j$ where $d_j$ is touched only by internal edges contributes PSD mass only in the $I$-block of $\bm{\Gamma}_S$.
+It adds to $\bm{\Gamma}_{II}$ but not to $\bm{\Gamma}_{BI}$ or $\bm{\Gamma}_{BB}$.
+Its contribution to the Schur complement is exactly zero---it cannot be ``seen'' from the boundary.
+Such edges have zero leverage and are pruned for free.
+
+\subsection{Coverage and conditioning}\label{sec:coverage}
+
+The boundary Schur complement $\bm{\Gamma}_\cB^*$ has eigendecomposition $\bm{\Gamma}_\cB^* = \bm{V}\bm{\Omega}\bm{V}^\top$ with eigenvalues $\omega_1 \geq \cdots \geq \omega_{D_B} \geq 0$.
+The eigenvectors $\bm{V}$ are inherited from the Jacobian structure of the graph's transforms, propagated through the Schur complement; the eigenvalues $\omega_i$ reflect how much precision each direction carries.
+The score decomposes as:
 \begin{equation}\label{eq:decomp}
-    \boxed{\;\|\bb_\cB^{(T)}\|^2 \;=\; \underbrace{\|\bb_\cB^\perp\|^2}_{\text{coverage gap}} \;+\; \underbrace{\sum_{i=1}^{D}(1-\eta\lambda_i)^{2T}\,c_{\cB,i}^2}_{\text{conditioning penalty}}.\;}
+    J(S) = \sum_{i=1}^{D_B} \frac{\sigma_i}{\omega_i + \varepsilon},
 \end{equation}
-Here $\bb_\cB^\perp$ is the component of $\bb_\cB$ orthogonal to $\mathrm{col}(\bm{A}_\cB)$, the eigenvalues $\lambda_i$ are those of the \emph{full} precision matrix $\bm{\Gamma}_\cG$, and $c_{\cB,i}$ are the coefficients of $\bb_\cB$ in the eigenbasis of $\bm{\Gamma}_\cG$.
+where $\sigma_i = \bv_i^\top\bm{\Sigma}_{\mathrm{task}}\bv_i$ is the task variance along eigendirection $\bv_i$.
+This separates into two failure modes:
+\begin{itemize}[nosep,leftmargin=2em]
+    \item \textbf{Coverage gap}: directions with $\omega_i \approx 0$ contribute $\sigma_i/\varepsilon$---large, regularisation-dominated terms.
+    These are boundary directions that no internal path connects, structurally unreachable regardless of inference budget.
+    \item \textbf{Conditioning penalty}: directions with $0 < \omega_i \ll 1/\eta T$ contribute terms that are resolved too slowly.
+    These are reachable but poorly conditioned---the inference-side analogue of vanishing gradients through deep chains.
+\end{itemize}
+A good architecture minimises both: full coverage (every task-relevant boundary direction is reachable through internal structure) and good conditioning (reachable directions have large eigenvalues in $\bm{\Gamma}_\cB^*$).
 
-\subsection{Relation to model evidence and Bayesian model reduction}\label{sec:evidence}
+\subsection{Why finite $T$ matters}\label{sec:whyT}
 
-The Laplace-approximated log marginal likelihood at the converged state $\bx^*$ is
-\begin{equation}\label{eq:laplace}
-    -\log p(\by\mid\cG) \;\approx\; E(\bx^*;\by) \;+\; \tfrac{1}{2}\log\det(\bm{\Gamma}_\cG) \;-\; \tfrac{D}{2}\log(2\pi).
-\end{equation}
-BMR~\citep{friston2018bmr} scores reduced models by the change in variational free energy under modified priors, which is analytic given the full model's posterior precision~\citep{friston2016group}.
-Our approach has the same \emph{invert-once-reduce-many} structure but replaces the score.
+At convergence ($T\to\infty$, equivalently $\varepsilon\to 0$), the score depends only on whether $\omega_i > 0$---the rank of $\bm{\Gamma}_\cB^*$.
+A 100-layer chain and a single skip connection score identically if both provide full-rank boundary coupling.
+There is no basis for preferring one over the other.
 
-The Occam factor $\frac{1}{2}\sum_i\log\lambda_i$ penalises \emph{large} eigenvalues: over-committed capacity.
-The conditioning penalty penalises \emph{small} eigenvalues: computationally inaccessible capacity.
-BMR asks ``does removing this component reduce model evidence?''
-We ask ``does removing this edge increase expected boundary residual variance within the inference budget?''
-The answer is read from the same object---the precision matrix inverse---but scored against computational accessibility rather than statistical complexity.
+The conditioning penalty restores discrimination.
+Setting $\varepsilon = 1/\eta T$ (matching the spectral gate of $T$-step gradient descent), the score penalises boundary directions whose precision $\omega_i$ falls below $1/\eta T$.
+A deep chain has exponentially spread eigenvalues in $\bm{\Gamma}_\cB^*$---most below the gate.
+A skip connection has $O(1)$ eigenvalues---above the gate.
+The inference budget $T$ is the mechanism that makes structure learning non-trivial.
 
-\subsection{The energy gap}\label{sec:gap}
+\subsection{Relation to model evidence}\label{sec:evidence}
 
-A low $J_T(\cG)$ could reflect a flexible column space that accommodates any target.
-To measure whether the graph's geometry actually aligns with the task, we compare correct and incorrect labels:
-\begin{equation}\label{eq:egap}
-    \Delta E = J_T(\cG;\by_{\mathrm{wrong}}) - J_T(\cG;\by_{\mathrm{true}}).
-\end{equation}
-Combining fit and selectivity:
-\begin{equation}\label{eq:score}
-    \mathrm{Score}(\cG) = -\,J_T(\cG;\by_{\mathrm{true}}) + w\cdot\Delta E,
-\end{equation}
-where both terms are computed as batch averages of per-sample boundary profiled energies.
+The Laplace-approximated log marginal likelihood includes an Occam factor $\frac{1}{2}\log\det(\bm{\Gamma}_\cG)$ penalising \emph{large} eigenvalues (over-committed capacity).
+Our score penalises \emph{small} eigenvalues of the boundary Schur complement (computationally inaccessible capacity).
+These are complementary: model evidence asks ``does this graph overfit?''; our score asks ``can this graph resolve the boundary task?''
+Bayesian model reduction~\citep{friston2018bmr,friston2016group} scores reduced models by the change in variational free energy; we score by the change in boundary precision.
+Both share the \emph{invert-once-reduce-many} structure (Section~\ref{sec:woodbury}).
 
 %═══════════════════════════════════════════════════════════════
-\section{Structure Search via Leverage-Score Reduction}\label{sec:search}
+\section{Backward Elimination}\label{sec:search}
 %═══════════════════════════════════════════════════════════════
 
-Because each edge contributes an independent PSD term to the precision matrix, the marginal contribution of every edge to the boundary score can be evaluated analytically from a single matrix inverse.
+\subsection{Algorithm}\label{sec:algorithm}
 
-\subsection{The supergraph and its inverse}\label{sec:supergraph}
-
-Let $\cG_{\mathrm{full}}$ be the supergraph containing all $M$ candidate edges.
-Run $T$ steps of inference on $\cG_{\mathrm{full}}$ with random (or pretrained) parameters $\btheta$.
-Form the regularised precision matrix and invert once:
-\begin{equation}\label{eq:MG}
-    \bm{M}_\cG = \bm{\Gamma}_\cG + \varepsilon\bm{I} = \sum_e \bm{J}_e^\top\bm{\Lambda}_e\bm{J}_e + \varepsilon\bm{I}, \qquad \bm{M}_\cG^{-1} \;\text{computed once}.
-\end{equation}
-Record the boundary residual $\bb_\cB$ at the converged state.
-This is the analogue of fitting the full model in BMR.
-Cost: $O(D^3)$ for the inversion.
-
-\subsection{Per-edge leverage scores}\label{sec:leverage}
-
-The \textbf{leverage score} of edge $e$ measures how much of the graph's ability to resolve boundary task variance depends uniquely on that edge.
-Formally, it is the increase in $J_T(\cG)$ under removal of edge $e$:
-\begin{equation}\label{eq:leverage}
-    \ell_e = J_T(\cG \setminus e) - J_T(\cG) \;\geq\; 0.
-\end{equation}
-The inequality holds for internal edges because removing a PSD term from the precision matrix can only weaken inference against the fixed task covariance $\bm{\Sigma}_{\mathrm{task}}$.
-
-In practice, we estimate $\ell_e$ by averaging per-sample leverage over the probe batch.
-For a single sample with boundary residual $\bb_\cB$, the per-sample leverage is the increase in $\|\bb_\cB^{(T)}\|^2$ under the Woodbury downdate~\eqref{eq:downdate}.
-For the full precision matrix, removing edge $e$ subtracts its PSD contribution:
-\begin{equation}\label{eq:downdate}
-    (\bm{M}_\cG - \bm{J}_e^\top\bm{\Lambda}_e\bm{J}_e)^{-1} = \bm{M}_\cG^{-1} + \bm{M}_\cG^{-1}\bm{J}_e^\top(\bm{\Lambda}_e^{-1} - \bm{J}_e\bm{M}_\cG^{-1}\bm{J}_e^\top)^{-1}\bm{J}_e\bm{M}_\cG^{-1}.
-\end{equation}
-When an edge contributes a single correction direction $\bu$, the per-sample leverage on boundary residual $\bv$ reduces to
-\begin{equation}\label{eq:rank1}
-    \ell_e^{(n)} = \frac{(\bv^\top\bm{M}_\cG^{-1}\bu)^2}{1 - \bu^\top\bm{M}_\cG^{-1}\bu}\,,
-\end{equation}
-where the numerator measures how much of the resolved boundary residual depends on this edge and the denominator captures the degree to which other edges can compensate.
-The batch-averaged leverage $\ell_e = \frac{1}{N}\sum_n \ell_e^{(n)}$ weights edge directions by how much task variance they explain---the edge-level analogue of the A-optimal criterion.
-
-A computationally efficient proxy is the task-weighted trace:
-\begin{equation}\label{eq:proxy}
-    \tilde\ell_e = \left\|\bm{\Lambda}_e^{1/2}\bm{J}_e\,\bm{M}_\cG^{-1}\,\bm{A}_\cB^\top\,\hat{\bm{\Sigma}}_{\mathrm{task}}\,\bm{A}_\cB\,\bm{M}_\cG^{-1}\bm{J}_e^\top\bm{\Lambda}_e^{1/2}\right\|_{\mathrm{tr}},
-\end{equation}
-which measures edge $e$'s contribution to the resolved task variance.
-
-\subsection{Pruning algorithm}\label{sec:pruning}
-
-The non-negativity of leverage scores for internal edges makes pruning well-posed: every removal increases $J_T(\cG)$ (or leaves it unchanged), so the score curve is monotonically non-decreasing as internal edges are removed.
-Boundary edges are never pruned---they define the task interface.
-The pruning algorithm traces the score curve over internal edges and stops when the increase exceeds a tolerance.
+Given per-edge Jacobians $\bm{J}_e$ (computed from a single forward pass on the supergraph) and boundary residuals $\bb_{\cB,n}$ (from the probe batch), the score of any edge set $S$ is computable in $O(D^3)$ via the Schur complement~\eqref{eq:schur} and the trace~\eqref{eq:score_def}.
 
 \begin{algorithm}[t]
-\caption{Inference-Aware Structure Reduction}
-\label{alg:reduce}
+\caption{Backward Elimination via Boundary Schur Complement}
+\label{alg:exact}
 \begin{algorithmic}[1]
-\REQUIRE Supergraph $\cG_{\mathrm{full}}$ with $M$ edges, probe batch $\{(\bx_n,\by_n)\}_{n=1}^B$
-\REQUIRE Inference steps $T$, prune fraction $\rho$, tolerance $\delta$
-\STATE Draw $\btheta\sim p(\btheta)$ (or load pretrained); run $T$ inference steps on $\cG_{\mathrm{full}}$
-\STATE Classify edges: $\cB$ (boundary), $\cI$ (internal)
-\STATE Record boundary residuals $\{\bb_{\cB,n}\}_{n=1}^B$ and Jacobians $\bm{J}_e$, curvatures $\bm{\Lambda}_e$ for all $e$
-\STATE Form $\bm{M}_\cG = \sum_e \bm{J}_e^\top\bm{\Lambda}_e\bm{J}_e + \varepsilon\bm{I}$; compute $\bm{M}_\cG^{-1}$
-\STATE $J_{\mathrm{prev}} \leftarrow \frac{1}{B}\sum_n \|\bb_{\cB,n}^{(T)}\|^2$
+\REQUIRE Supergraph with $M$ edges, probe batch $\{(\bx_n,\by_n)\}_{n=1}^N$, gate $\varepsilon = 1/\eta T$
+\STATE One forward pass: compute $\bm{J}_e$, $\bm{\Lambda}_e$ for all edges; $\bb_{\cB,n}$ for all samples
+\STATE Classify edges: $\cB$ (boundary, fixed), $\cI$ (internal, prunable)
+\STATE Compute $\bm{\Sigma}_{\mathrm{task}} = \frac{1}{N}\sum_n\bb_{\cB,n}\bb_{\cB,n}^\top$
+\STATE $S \leftarrow \{1,\dots,M\}$; \; $J_{\mathrm{curr}} \leftarrow J(S)$
 \REPEAT
-    \STATE Compute leverage $\ell_e = \frac{1}{B}\sum_n \ell_e^{(n)}$ for all active internal edges $e \in \cI$
-    \STATE Identify lowest-leverage fraction $\rho$ of active internal edges
-    \FOR{each edge $e$ in removal set (ascending leverage)}
-        \STATE Update $\bm{M}_\cG^{-1}$ via Woodbury downdate~\eqref{eq:downdate}
-        \STATE Remove $e$ from active edge set
+    \FOR{each $e \in S \cap \cI$}
+        \STATE $J_e \leftarrow J(S\setminus\{e\})$ \hfill\COMMENT{$O(D^3)$ via Schur complement}
     \ENDFOR
-    \STATE $J_{\mathrm{curr}} \leftarrow$ batch-averaged boundary profiled energy on reduced graph
-    \IF{$J_{\mathrm{curr}} - J_{\mathrm{prev}} > \delta$}
-        \STATE Restore last removal batch; \textbf{break}
+    \STATE $e^* \leftarrow \arg\min_{e \in S \cap \cI} J_e$
+    \IF{$J_{e^*} > J_{\mathrm{curr}} + \delta$}
+        \STATE \textbf{break} \hfill\COMMENT{every removal exceeds tolerance}
     \ENDIF
-    \STATE $J_{\mathrm{prev}} \leftarrow J_{\mathrm{curr}}$
-\UNTIL{no active internal edges remain below leverage threshold}
-\RETURN Reduced graph $\cG^*$, leverage scores, decomposed $J_T$
+    \STATE $S \leftarrow S \setminus \{e^*\}$; \; $J_{\mathrm{curr}} \leftarrow J_{e^*}$
+\UNTIL{$S \cap \cI = \emptyset$}
+\RETURN Edge set $S$, Schur complement $\bm{\Gamma}_\cB^*(S)$, score decomposition
 \end{algorithmic}
 \end{algorithm}
 
-\paragraph{Why boundary edges are not pruned.}
-Boundary edges define the task interface: they are the edges through which data enters and exits the model.
-Removing a boundary edge changes the \emph{problem} (which data the graph can see or predict), not the \emph{solution} (how efficiently the graph solves it).
-Internal edges are the structural design choices; boundary edges are architectural requirements.
+\paragraph{Boundary edges are never pruned.}
+They define the task interface---removing one changes which data the graph can see.
 
-\paragraph{Output.}
-The algorithm returns the reduced graph $\cG^*$, the leverage score of every retained edge, and the decomposed score $J_T = \text{coverage gap} + \text{conditioning penalty}$, which is a certificate of what the reduced graph can and cannot do.
+\paragraph{Stopping criterion.}
+By monotonicity, $J(S\setminus\{e\}) \geq J(S)$ for all internal $e$.
+Dead-end edges give $J(S\setminus\{e\}) = J(S)$ exactly (zero contribution to Schur complement) and are removed for free.
+The algorithm stops when the cheapest removal exceeds tolerance $\delta$---every remaining edge contributes meaningful boundary precision.
 
-\paragraph{Why boundary scoring makes pruning well-posed.}
-Without the boundary restriction, removing an edge removes both its correction capacity \emph{and} the prediction errors it generates at random initialisation.
-Since random edges typically produce large errors, removal can decrease the total profiled energy, and the algorithm prunes to a trivial graph.
-Evaluating at the boundary eliminates this pathology: internal edges contribute only capacity (through $\bm{\Gamma}_\cG$), never evaluation error (through $\bm{\Sigma}_{\mathrm{task}}$).
-The task covariance framing makes this especially clean: $\bm{\Sigma}_{\mathrm{task}}$ is a property of the data distribution at the boundary, invariant to which internal edges are active.
+\paragraph{Cost.}
+Each step evaluates $|S\cap\cI|$ candidates at $O(D^3)$ each (or $O(D_B^3)$ if only the Schur complement is recomputed).
+Total: $O(M^2 D_B^3)$.
+For $D_B \lesssim 200$ and $M \lesssim 100$, this completes in seconds.
 
-\paragraph{Frozen driving force.}
-The monotonicity argument requires that removing an internal edge only weakens the preconditioner $\bm{\Gamma}_\cG$ without changing the inference driving force.
-In practice, removing edge $e$ also removes its gradient contribution $\bm{J}_e^\top\bm{\Lambda}_e\br_e$ from the right-hand side that drives state updates.
-To maintain monotonicity, we freeze the driving force $\bm{d} = \bm{A}_\cG^\top\bb$ at the full-graph value and evaluate the reduced graph's spectral filter against this fixed $\bm{d}$.
-By Weyl's inequality, removing a PSD term from $\bm{\Gamma}_\cG$ can only decrease eigenvalues, which can only worsen the spectral filter, which can only increase the boundary residual under the frozen driving force.
-In experiments, the frozen-RHS approximation maintains monotonicity through nearly all pruning rounds; a small violation (${\sim}0.5\%$) can appear when the graph is reduced to very few edges and the linearisation becomes loose.
+\subsection{Scalable approximation via Woodbury}\label{sec:woodbury}
 
-\paragraph{Computational cost.}
-The dominant cost is the initial $O(D^3)$ inversion.
-Each pruning round costs $O(|\text{batch}| \cdot D^2 \cdot d_{\mathrm{tgt}})$ for per-sample leverage estimation plus $O(D^3)$ for exact $J_T$ evaluation via eigendecomposition.
-The eigendecomposition is performed only $O(\log M)$ times (once per pruning round); per-sample leverage is the inner loop.
-For $D \lesssim 10{,}000$ and $M \lesssim 1{,}000$, the entire procedure completes in seconds.
-For larger $D$, the explicit inverse can be replaced by conjugate gradient solves, with leverage scores estimated via stochastic trace estimators~\citep{hutchinson1989stochastic}.
-
-\subsection{Connection to matching pursuit}\label{sec:pursuit}
-
-The \emph{forward} direction of structure search---adding edges to a minimal graph---is matching pursuit~\citep{mallat1993matching} in Jacobian space: the dictionary is the set of candidate correction operators; the signal is the boundary coverage gap $\bb_\cB^\perp$; each step selects the atom best aligned with the unexplained boundary residual.
-The backward direction (Algorithm~\ref{alg:reduce}) is the same problem viewed from the other end.
-Both exploit the additive PSD structure of the precision matrix.
-The backward direction is preferred because it starts with full information about edge interactions: leverage scores account for redundancy automatically, and the exploration problem that plagues forward search---candidates touching disconnected variables have zero gain---is absent.
+For large $D$, maintain $\bm{\Gamma}_S^{-1}$ and update incrementally.
+The Schur complement can be read from $\bm{\Gamma}_S^{-1}$: $(\bm{\Gamma}_\cB^*)^{-1} = [\bm{\Gamma}_S^{-1}]_{BB}$, the $B$-block of the full inverse~\citep{lauritzen1996graphical}.
+Removing edge $e$ updates $\bm{\Gamma}_S^{-1}$ via:
+\begin{equation}\label{eq:woodbury}
+    (\bm{\Gamma}_S - \bm{J}_e^\top\bm{\Lambda}_e\bm{J}_e)^{-1} = \bm{\Gamma}_S^{-1} + \bm{\Gamma}_S^{-1}\bm{J}_e^\top(\bm{\Lambda}_e^{-1} - \bm{J}_e\bm{\Gamma}_S^{-1}\bm{J}_e^\top)^{-1}\bm{J}_e\bm{\Gamma}_S^{-1},
+\end{equation}
+reducing per-candidate cost from $O(D^3)$ to $O(D^2 d_{\mathrm{tgt}})$.
+The updated score is read from the $B$-block of the downdated inverse.
+This is the structural analogue of BMR: invert once, score every reduction analytically.
 
 %═══════════════════════════════════════════════════════════════
-\section{How Structure Enters the Precision Matrix}\label{sec:structure}
+\section{How Structure Enters the Schur Complement}\label{sec:structure}
 %═══════════════════════════════════════════════════════════════
 
-Each edge contributes a PSD term $\bm{J}_e^\top\bm{\Lambda}_e\bm{J}_e$ whose algebraic structure reflects the transform, whose weighting reflects the energy, and whose coupling with other terms reflects the topology.
-We trace these contributions at random initialisation through the coverage/conditioning decomposition, drawing on standard results in random matrix theory~\citep{marchenko1967distribution,gray2006toeplitz}.
+Each edge contributes a PSD term to $\bm{\Gamma}_S$, which enters the Schur complement $\bm{\Gamma}_\cB^*$ through the block structure~\eqref{eq:block}.
+We trace how topology and transform families affect boundary precision at random initialisation.
 
-\paragraph{Depth.}
-A chain $\bv_0\to\cdots\to\bv_L$ produces effective Jacobians involving products of per-layer matrices whose singular values spread exponentially with depth: $\sigma_{\max}/\sigma_{\min}\sim e^{cL}$.
-Most eigenvalues of $\bm{\Gamma}_\cG$ fall below the spectral gate---the inference-side analogue of vanishing gradients.
+\paragraph{Chain edges.}
+A chain $\bv_0 \to h_1 \to \cdots \to h_L \to \bv_L$ where $\bv_0$ and $\bv_L$ are boundary-connected creates off-diagonal coupling $\bm{\Gamma}_{BI}$ between boundary and internal dimensions.
+The Schur complement $\bm{\Gamma}_{BB} - \bm{\Gamma}_{BI}\bm{\Gamma}_{II}^{-1}\bm{\Gamma}_{IB}$ propagates precision from input to output through the chain.
+Under random initialisation, the effective coupling decays exponentially with depth (singular values of the composed Jacobian spread as $e^{cL}$), so the boundary precision from a deep chain has exponentially spread eigenvalues---most below the spectral gate.
 
 \paragraph{Skip connections.}
-A skip edge $\bv_i\to\bv_j$ adds a PSD term with $O(1)$ eigenvalues at random init---no multiplicative composition.
-It raises the smallest eigenvalues of $\bm{\Gamma}_\cG$: an additive correction to the preconditioner's spectral spread.
-Skip connections in deep graphs will have high leverage because they provide the directions that the chain alone cannot resolve within budget.
+A skip edge $\bv_i \to \bv_j$ between two boundary-connected variables adds directly to $\bm{\Gamma}_{BB}$---no marginalisation needed.
+Its contribution has $O(1)$ eigenvalues at random init.
+In deep graphs, skip connections dominate the Schur complement because the chain's contribution is exponentially attenuated.
+
+\paragraph{Dead-end edges.}
+An edge $h_i \to d_j$ where $d_j$ has no boundary connection contributes only to $\bm{\Gamma}_{II}$.
+It does not appear in $\bm{\Gamma}_{BI}$ or $\bm{\Gamma}_{BB}$.
+Its contribution to the Schur complement is exactly zero.
 
 \paragraph{Parallel edges.}
-$K$ parallel edges contribute $K$ independent PSD terms whose summed eigenvalues concentrate more tightly around the mean.
-Each individual parallel edge has low leverage (redundant with its neighbours); the pruning algorithm naturally thins them to the minimum set needed for adequate conditioning.
+$K$ parallel edges contribute $K$ independent PSD terms.
+The first provides new rank in $\bm{\Gamma}_\cB^*$ (large leverage); additional ones add eigenvalue mass on existing directions (decreasing marginal leverage).
+The algorithm naturally thins parallel edges to the minimum set.
 
 \paragraph{Dense transforms.}
-$f(\bv)=\bm{W}\bv$ with i.i.d.\ entries gives a Wishart contribution $\bm{W}^\top\bm{W}$ with isotropic eigenvectors.
-No direction is preferred; dense transforms provide capacity without structural prior.
+$f(\bv) = \bm{W}\bv$ with i.i.d.\ entries gives a Wishart contribution with isotropic eigenvectors (Haar-distributed singular vectors).
+No direction is preferred; the boundary precision aligns with the task no better than chance.
+Dense transforms provide capacity without directional bias---a neutral baseline against which structured transforms are measured.
 
 \paragraph{Convolutional transforms.}
-$f(\bv)=\bm{W}*\bv$ gives a block-circulant Jacobian diagonalised by the DFT regardless of filter values.
-The precision contribution has eigenvectors fixed to the Fourier basis; only eigenvalues are random.
-On natural images, this separates signal from noise in a way isotropic eigenvectors cannot.
+$f(\bv) = \bm{W}*\bv$ gives a block-circulant Jacobian diagonalised by the DFT, regardless of filter values.
+The Schur complement inherits Fourier eigenvectors: boundary precision decomposes by spatial frequency.
+On natural images, whose task covariance $\bm{\Sigma}_{\mathrm{task}}$ concentrates variance at low spatial frequencies, this alignment produces a lower score than isotropic alternatives---the mechanism by which the algorithm prefers convolutions on images.
 
 \paragraph{Attention.}
-At random init with large key dimension, the Jacobian approximates mean-pooling composed with a random value projection, emphasising position-averaged correction directions.
+At random init, the Jacobian approximates mean-pooling with a random value projection, contributing position-averaged precision to $\bm{\Gamma}_\cB^*$.
+On sequential data where $\bm{\Sigma}_{\mathrm{task}}$ has positional structure, this alignment is favourable.
 
 \paragraph{Recurrence.}
-The Jacobian from time $t$ to $T$ involves products $\prod_{s=t}^{T-1}\mathrm{diag}(\sigma'_s)\bm{W}_h$ whose singular values decay with lag; long-range modes are suppressed.
-Gated variants introduce additive paths that preserve singular values.
-
-\paragraph{Energy functions.}
-Squared error gives $\bm{\Lambda}_e=\bm{I}$ (isotropic).
-Cross-entropy gives $\bm{\Lambda}_e=\mathrm{diag}(\bm{p})-\bm{p}\bm{p}^\top$ (PSD on the simplex tangent space).
+Jacobians involve matrix products with singular values decaying with lag.
+The Schur complement from a recurrent path attenuates long-range boundary coupling.
+Gated variants preserve singular values, maintaining boundary precision over longer horizons.
 
 %═══════════════════════════════════════════════════════════════
 \section{Related Work}\label{sec:related}
 %═══════════════════════════════════════════════════════════════
 
 \paragraph{Bayesian model reduction.}
-BMR~\citep{friston2018bmr,friston2016group} fits a full model via variational Bayes, then analytically scores every reduced model that differs only in its priors.
-Our approach inherits the \emph{invert-once-reduce-many} structure but operates on graph structure rather than parameter priors, and scores by boundary profiled energy rather than variational free energy.
-The key difference is which end of the spectrum is penalised: BMR's Occam factor penalises large eigenvalues (statistical over-commitment), while the conditioning penalty penalises small eigenvalues (computational inaccessibility).
-BMR has recently been applied to neural network pruning~\citep{beckers2024bmrs}, where parameters are removed by shrinking their prior variance to zero.
-Our method removes \emph{edges}---the natural structural unit for models whose energy decomposes over factors.
+BMR~\citep{friston2018bmr,friston2016group} fits a full model, then analytically scores reduced models differing only in priors.
+Our ridge approximation (Section~\ref{sec:woodbury}) inherits this structure but operates on graph edges and scores by boundary precision rather than variational free energy.
+BMR penalises large eigenvalues (statistical over-commitment); we penalise small eigenvalues of the Schur complement (computational inaccessibility).
+BMR has been applied to neural network pruning~\citep{beckers2024bmrs}; we prune edges---the natural structural unit for locally factored energies.
 
 \paragraph{Structure learning in graphical models.}
-The precision matrix and its decomposition over cliques are foundational to Gaussian graphical models~\citep{lauritzen1996graphical}; score-based structure learning selects graphs by penalised likelihood or independence tests~\citep{koller2009pgm}.
-Our approach uses the same object in a different regime: random initialisation of neural transforms, finite-step inference, and heterogeneous parameterised factors.
+The Schur complement of the precision matrix as marginal precision is foundational to Gaussian graphical models~\citep{lauritzen1996graphical,koller2009pgm}.
+Score-based structure learning selects graphs by penalised likelihood or independence tests.
+Our approach uses the same object at random initialisation with heterogeneous neural transforms and a finite-budget spectral gate.
 
-\paragraph{Neural architecture search without training.}
-The Neural Tangent Kernel~\citep{jacot2018neural} linearises around parameters and produces a Gram matrix governing \emph{learning} dynamics.
-TE-NAS~\citep{chen2021tenas} and NASI~\citep{shu2022nasi} use NTK-derived quantities to rank architectures without training, but \citet{mok2022demystifying} show modern architectures leave the NTK regime quickly, and \citet{zhou2024vintk} find NTK metrics ineffective on Vision Transformers because the kernel conflates attention and MLP spectra through end-to-end composition.
-The precision-matrix approach avoids this: it decomposes over local factors, linearises ${\sim}20$ inference steps rather than $10^3$--$10^4$ training steps, and discriminates through both coverage and conditioning in a single score.
+\paragraph{Training-free NAS.}
+TE-NAS~\citep{chen2021tenas} and NASI~\citep{shu2022nasi} use NTK-derived quantities~\citep{jacot2018neural} to rank architectures, but NTK metrics conflate component spectra through end-to-end composition~\citep{mok2022demystifying,zhou2024vintk}.
+The Schur complement decomposes over local factors and marginalises internal structure, avoiding this conflation.
+
+\paragraph{Optimal experimental design.}
+The score~\eqref{eq:score_def} is A-optimal: it minimises expected posterior variance at the boundary under the task distribution~\citep{pukelsheim2006optimal}.
+Greedy backward elimination for A-optimal design has approximate submodularity guarantees~\citep{krause2008near}, which may provide non-trivial bounds on the quality of the reduced graph.
 
 \paragraph{Sparse approximation.}
-The forward direction of structure search (Section~\ref{sec:pursuit}) is matching pursuit~\citep{mallat1993matching} in Jacobian space.
-Compressed sensing theory~\citep{tropp2004greed} provides convergence guarantees under dictionary coherence conditions whose applicability to neural Jacobian dictionaries is an open question.
+Forward structure search---adding edges greedily to increase boundary precision---is matching pursuit~\citep{mallat1993matching} in Jacobian space.
+Compressed sensing theory~\citep{tropp2004greed} provides guarantees under dictionary coherence conditions.
 
 %═══════════════════════════════════════════════════════════════
 \section{Discussion}\label{sec:discussion}
 %═══════════════════════════════════════════════════════════════
 
-We have developed a structure-learning method for energy-based models that applies the logic of Bayesian model reduction to graph structure, scored by expected boundary residual variance rather than variational free energy.
-The core mechanism is the additive decomposition of the inference precision matrix over edges, which gives: a decomposed score separating coverage from conditioning, per-edge leverage scores from a single matrix inverse, and an efficient pruning algorithm via Woodbury downdates---with the guarantee that leverage scores for internal edges are non-negative, making greedy pruning well-posed.
+We have presented a structure-learning method for energy-based models that scores graph topology by how well the directional structure of its boundary precision matches the task.
 
-The boundary evaluation principle---all edges shape inference, only boundary edges define the task---resolves the tension between an edge's dual role as both error source and correction mechanism.
-The task covariance formulation makes the score a property of the graph's interaction with the data distribution, not an artifact of a single residual draw, connecting the framework to A-optimal experimental design.
-At random initialisation, where internal prediction errors are large and uninformative, this distinction is essential; on pretrained models, where internal errors are small and structured, the distinction remains formally correct.
+The method rests on three observations.
+First, each transform type imposes a specific eigenvector basis on its contribution to the precision matrix---Fourier for convolutions, isotropic for dense, position-averaged for attention---and this basis is an algebraic property of the transform class, not an artifact of random weights.
+The Schur complement propagates this directional structure to the boundary, where the A-optimal score measures its alignment with the task covariance.
+This is the mechanism that drives architecture selection: convolutions are preferred on images because their Fourier precision matches the frequency structure of natural image data.
+Second, the energy's local factorisation makes the precision matrix additive over edges, and the Schur complement inherits monotonicity: adding an internal edge can only increase boundary precision.
+Third, the spectral gate $\varepsilon = 1/\eta T$ connects the inference budget to the score: at convergence all connected graphs look alike, but at finite $T$ the conditioning of the Schur complement discriminates between them.
 
-The framework applies to any model with an energy that decomposes over local factors.
-At random initialisation, it selects graph structure before any training.
-On a pretrained model, the same algorithm performs post-hoc pruning, identifying edges whose contributions are redundant or below the spectral gate.
+The algorithm is simple: backward elimination, removing the internal edge whose removal least increases the boundary score.
+Dead-end edges have zero contribution and are removed for free.
+Chain edges propagate precision through internal variables and survive until their exponentially attenuated coupling falls below the gate.
+Skip connections add direct boundary coupling and survive longest.
 
-The framework makes concrete predictions.
-The boundary score $J_T$ should correlate with trained accuracy on NAS benchmarks.
-The energy gap should track inductive bias: convolutional edges favoured on images, attention on sequences.
-Skip connections should have high leverage in deep graphs.
-Leverage-based pruning should outperform random pruning and match or exceed BMR-based pruning on energy-based models.
-The method should remain discriminative on heterogeneous search spaces where existing training-free metrics degrade.
+The framework makes concrete, mechanistically grounded predictions.
+Dead-end edges should be pruned first (zero Schur complement contribution).
+Chain edges should be pruned before skip connections in deep graphs (exponentially attenuated boundary coupling vs.\ $O(1)$ direct coupling).
+Convolutional edges should be preferred over dense edges on natural images (Fourier precision aligns with frequency-structured task covariance).
+Attention edges should be preferred on sequential data (position-averaged precision aligns with positional task covariance).
+The pruning order should be $T$-sensitive: short budgets favour direct paths, long budgets tolerate depth (the spectral gate determines which conditioning levels are acceptable).
+Each prediction follows from a specific algebraic property of the transforms, not from a fitted correlation.
 
 %═══════════════════════════════════════════════════════════════
 
@@ -401,11 +365,11 @@ S.~Beckers, J.~Jantre, and others.
 
 \bibitem[Chen et~al.(2021)]{chen2021tenas}
 W.~Chen, X.~Gong, and Z.~Wang.
-\newblock Neural architecture search on {ImageNet} in four {GPU} hours: A theoretically inspired perspective.
+\newblock Neural architecture search on {ImageNet} in four {GPU} hours.
 \newblock In \emph{ICLR}, 2021.
 
 \bibitem[Friston et~al.(2016)]{friston2016group}
-K.~J.~Friston, V.~Litvak, A.~Oswal, A.~Razi, K.~E.~Stephan, B.~C.~M.~van Wijk, G.~Ziegler, and P.~Zeidman.
+K.~J.~Friston et~al.
 \newblock {B}ayesian model reduction and empirical {B}ayes for group ({DCM}) studies.
 \newblock \emph{NeuroImage}, 128:413--431, 2016.
 
@@ -419,11 +383,6 @@ R.~M.~Gray.
 \newblock \emph{Toeplitz and Circulant Matrices: A Review}.
 \newblock Now Publishers, 2006.
 
-\bibitem[Hutchinson(1989)]{hutchinson1989stochastic}
-M.~F.~Hutchinson.
-\newblock A stochastic estimator of the trace of the influence matrix.
-\newblock \emph{Commun.\ Statist.---Simula.}, 18(3):1059--1076, 1989.
-
 \bibitem[Jacot et~al.(2018)]{jacot2018neural}
 A.~Jacot, F.~Gabriel, and C.~Hongler.
 \newblock Neural tangent kernel: Convergence and generalization in neural networks.
@@ -433,6 +392,11 @@ A.~Jacot, F.~Gabriel, and C.~Hongler.
 D.~Koller and N.~Friedman.
 \newblock \emph{Probabilistic Graphical Models: Principles and Techniques}.
 \newblock MIT Press, 2009.
+
+\bibitem[Krause et~al.(2008)]{krause2008near}
+A.~Krause, A.~Singh, and C.~Guestrin.
+\newblock Near-optimal sensor placements in {Gaussian} processes: Theory, efficient algorithms and empirical studies.
+\newblock \emph{JMLR}, 9:235--284, 2008.
 
 \bibitem[Lauritzen(1996)]{lauritzen1996graphical}
 S.~L.~Lauritzen.
@@ -456,8 +420,13 @@ T.~P.~Minka.
 
 \bibitem[Mok et~al.(2022)]{mok2022demystifying}
 J.~Mok, B.~Na, H.~Choe, and S.~Yoon.
-\newblock Demystifying the neural tangent kernel from a practical perspective: Can it be trusted for {NAS} without training?
+\newblock Demystifying the neural tangent kernel from a practical perspective.
 \newblock In \emph{CVPR}, 2022.
+
+\bibitem[Pukelsheim(2006)]{pukelsheim2006optimal}
+F.~Pukelsheim.
+\newblock \emph{Optimal Design of Experiments}.
+\newblock SIAM, 2006.
 
 \bibitem[Ramsauer et~al.(2021)]{ramsauer2021hopfield}
 H.~Ramsauer et~al.
@@ -502,1074 +471,24 @@ W.~Zhou, J.~Huang, and others.
 
 \section{Gauss--Newton Decomposition}\label{app:hessian}
 
-For a single energy term $\E_i(\bv_i,\hat{\bv}_i)$ with prediction $\hat{\bv}_i = f_e(\bv_{\mathrm{src}(e)})$, the second derivative with respect to any free variable block $\bz$ is
+For a single energy term $\E_i(\bv_i,\hat{\bv}_i)$ with prediction $\hat{\bv}_i = f_e(\bv_{\mathrm{src}(e)})$, the Hessian with respect to free variables $\bz$ is
 \begin{equation}
-    \nabla^2_{\bz}\E_i = \bm{J}_e^{(\bz)\top}(\nabla^2_{\hat{v}}\E_i)\bm{J}_e^{(\bz)} + \sum_j(\nabla_{\hat{v}_j}\E_i)\nabla^2_{\bz}[f_e]_j,
+    \nabla^2_{\bz}\E_i = \bm{J}_e^{(\bz)\top}\bm{\Lambda}_e\bm{J}_e^{(\bz)} + \sum_j(\nabla_{\hat{v}_j}\E_i)\nabla^2_{\bz}[f_e]_j.
 \end{equation}
-where $\bm{J}_e^{(\bz)}=\partial f_e/\partial\bz$.
-The first term is the Gauss--Newton part: $\bm{J}_e^{(\bz)\top}\bm{\Lambda}_e\bm{J}_e^{(\bz)}$ with $\bm{\Lambda}_e = \nabla^2_{\hat{v}}\E_i\succeq 0$.
-The second term involves second derivatives of the transform weighted by the energy gradient, and is neglected when either (a)~prediction errors $\nabla_{\hat{v}}\E_i$ are small, or (b)~transforms are close to linear.
-At random initialisation neither condition is guaranteed; the approximation is a modelling choice whose quality improves as inference reduces residuals.
-Setting $\bz=\bx$ and summing over edges gives~\eqref{eq:hessian}.
-
-\section{Task Residual}\label{app:residual}
-
-$\bm{A}_\cG\in\R^{m\times D}$ maps state perturbations $\delta\bx$ to changes in curvature-weighted prediction space, with block row $[\bm{A}_\cG]_e = \bm{\Lambda}_e^{1/2}\bm{J}_e$.
-The boundary residual $\bb_\cB\in\R^{m_\cB}$ stacks curvature-weighted prediction errors $\bm{\Lambda}_e^{1/2}(f_e(\bv_{\mathrm{src}}) - \bv_{\mathrm{tgt}(e)})$ for boundary edges $e \in \cB$ only.
-The task covariance $\bm{\Sigma}_{\mathrm{task}} = \frac{1}{B}\sum_{n=1}^B \bb_{\cB,n}\bb_{\cB,n}^\top$ is the empirical second moment of boundary residuals over the probe batch.
-
-\section{Spectral Filter}\label{app:spectral}
-
-On the quadratic model $E = c + \frac{1}{2}\|\bm{A}\delta\bx-\bb\|^2$ with $\bm{\Gamma}=\bm{A}^\top\bm{A}=\bm{U\Lambda U}^\top$, gradient descent from $\delta\bx^{(0)}=0$ gives $\delta\bx^{(T)}=\bm{U}[\bm{I}-(\bm{I}-\eta\bm{\Lambda})^T]\bm{\Lambda}^{-1}\bm{U}^\top\bm{A}^\top\bb$.
-
-For boundary evaluation, let $\bm{A}_\cB$ denote the boundary rows of $\bm{A}$.
-The boundary residual after $T$ steps is $\bb_\cB^{(T)} = \bb_\cB - \bm{A}_\cB\delta\bx^{(T)}$.
-The full inference dynamics use all rows of $\bm{A}$ (all edges contribute to $\bm{\Gamma}$ and hence to $\delta\bx^{(T)}$), but the evaluation restricts to boundary rows.
-Decomposing $\bb_\cB = \bm{A}_\cB\bm{U}\bc_\cB + \bb_\cB^\perp$ with $\bb_\cB^\perp \perp \mathrm{col}(\bm{A}_\cB)$, the per-sample boundary profiled energy is:
-\begin{equation}
-    \|\bb_\cB^{(T)}\|^2 = \|\bb_\cB^\perp\|^2 + \sum_{i=1}^D(1-\eta\lambda_i)^{2T}c_{\cB,i}^2,
-\end{equation}
-where the eigenvalues $\lambda_i$ are those of the \emph{full} precision matrix $\bm{\Gamma}_\cG$ (all edges), and $c_{\cB,i}$ are the boundary coefficients.
-The score $J_T(\cG)$ is the expectation of this quantity over the probe batch:
-\begin{equation}
-    J_T(\cG) = \mathrm{tr}\!\Big(\bm{R}_T\,\bm{\Sigma}_{\mathrm{task}}\,\bm{R}_T^\top\Big),
-\end{equation}
-where $\bm{R}_T = \bm{I} - \bm{A}_\cB\,g_T(\bm{\Gamma}_\cG)\,\bm{A}_\cB^\top$ is the residual operator.
-The key asymmetry: the preconditioner $\bm{\Gamma}_\cG$ uses all edges; the task covariance $\bm{\Sigma}_{\mathrm{task}}$ uses only boundary edges.
-
-\end{appendices}
-
-\end{document}s in-column-space component in the eigenbasis of $\bm{\Gamma}_\cG$ (Appendix~\ref{app:spectral}).
-The score $J_T(\cG)$ is the expectation of~\eqref{eq:decomp} over the probe batch: the coverage gap becomes expected boundary variance orthogonal to the reachable subspace, and the conditioning penalty becomes expected boundary variance along poorly conditioned directions.
-
-This is the central result.
-The architecture score separates into two independent failure modes, with a clean separation of roles: internal edges affect the score \emph{only} through the eigenvalues $\lambda_i$ (the preconditioner), never through the task covariance $\bm{\Sigma}_{\mathrm{task}}$.
-
-The \textbf{coverage gap} measures expected boundary variance that no adjustment of free states can reduce---a hard structural limitation, independent of inference budget.
-The \textbf{conditioning penalty} collects expected boundary variance along directions that are reachable but resolved too slowly.
-Eigenvalues $\lambda_i \gg 1/\eta T$ yield factor $(1-\eta\lambda_i)^{2T}\approx 0$: mode resolved.
-Eigenvalues $\lambda_i \ll 1/\eta T$ yield factor $\approx 1$: mode frozen.
-The spectral gate at $\lambda_i \sim 1/\eta T$ is an implicit complexity penalty: the graph is credited only for modes it can exploit within its compute budget.
-
-Crucially, removing an internal edge can only \emph{increase} $J_T(\cG)$: it weakens the preconditioner (reduces some $\lambda_i$) without changing the task covariance $\bm{\Sigma}_{\mathrm{task}}$.
-This eliminates the pathology where pruning artificially improves the score by removing the prediction errors that an edge was generating.
-The boundary score provides the monotonic counterpressure that makes greedy pruning well-posed.
-
-\subsection{Relation to model evidence and Bayesian model reduction}\label{sec:evidence}
-
-The Laplace-approximated log marginal likelihood at the converged state $\bx^*$ is
-\begin{equation}\label{eq:laplace}
-    -\log p(\by\mid\cG) \;\approx\; E(\bx^*;\by) \;+\; \tfrac{1}{2}\log\det(\bm{\Gamma}_\cG) \;-\; \tfrac{D}{2}\log(2\pi).
-\end{equation}
-BMR~\citep{friston2018bmr} scores reduced models by the change in variational free energy under modified priors, which is analytic given the full model's posterior precision~\citep{friston2016group}.
-Our approach has the same \emph{invert-once-reduce-many} structure but replaces the score.
-
-The Occam factor $\frac{1}{2}\sum_i\log\lambda_i$ penalises \emph{large} eigenvalues: over-committed capacity.
-The conditioning penalty penalises \emph{small} eigenvalues: computationally inaccessible capacity.
-BMR asks ``does removing this component reduce model evidence?''
-We ask ``does removing this edge reduce the graph's ability to resolve the \emph{boundary task} within its inference budget?''
-The answer is read from the same object---the precision matrix inverse---but scored against computational accessibility rather than statistical complexity.
-
-\subsection{The energy gap}\label{sec:gap}
-
-A low boundary profiled energy could reflect a flexible column space that accommodates any target.
-To measure whether the graph's geometry actually aligns with the task, we compare correct and incorrect labels:
-\begin{equation}\label{eq:egap}
-    \Delta E = \phi_T^\cB(\by_{\mathrm{wrong}}) - \phi_T^\cB(\by_{\mathrm{true}}).
-\end{equation}
-Combining fit and selectivity:
-\begin{equation}\label{eq:score}
-    \mathrm{Score}(\cG) = -\,\overline{\phi_T^\cB(\by_{\mathrm{true}})} + w\cdot\overline{\Delta E},
-\end{equation}
-averaged over a probe batch ($B\approx 100$) and 3--5 random parameter seeds.
-
-%═══════════════════════════════════════════════════════════════
-\section{Structure Search via Leverage-Score Reduction}\label{sec:search}
-%═══════════════════════════════════════════════════════════════
-
-Because each edge contributes an independent PSD term to the precision matrix, the marginal contribution of every edge to the boundary score can be evaluated analytically from a single matrix inverse.
-
-\subsection{The supergraph and its inverse}\label{sec:supergraph}
-
-Let $\cG_{\mathrm{full}}$ be the supergraph containing all $M$ candidate edges.
-Run $T$ steps of inference on $\cG_{\mathrm{full}}$ with random (or pretrained) parameters $\btheta$.
-Form the regularised precision matrix and invert once:
-\begin{equation}\label{eq:MG}
-    \bm{M}_\cG = \bm{\Gamma}_\cG + \varepsilon\bm{I} = \sum_e \bm{J}_e^\top\bm{\Lambda}_e\bm{J}_e + \varepsilon\bm{I}, \qquad \bm{M}_\cG^{-1} \;\text{computed once}.
-\end{equation}
-Record the boundary residual $\bb_\cB$ at the converged state.
-This is the analogue of fitting the full model in BMR.
-Cost: $O(D^3)$ for the inversion.
-
-\subsection{Per-edge leverage scores}\label{sec:leverage}
-
-The \textbf{leverage score} of edge $e$ measures how much of the graph's ability to resolve the boundary task depends uniquely on that edge.
-We define it as the change in boundary profiled energy under removal of edge $e$, evaluated via the Woodbury downdate.
-
-For the full precision matrix, removing edge $e$ subtracts its PSD contribution:
-\begin{equation}\label{eq:downdate}
-    (\bm{M}_\cG - \bm{J}_e^\top\bm{\Lambda}_e\bm{J}_e)^{-1} = \bm{M}_\cG^{-1} + \bm{M}_\cG^{-1}\bm{J}_e^\top(\bm{\Lambda}_e^{-1} - \bm{J}_e\bm{M}_\cG^{-1}\bm{J}_e^\top)^{-1}\bm{J}_e\bm{M}_\cG^{-1}.
-\end{equation}
-The boundary residual $\bb_\cB$ is held fixed---it depends on the data, not on which internal edges are active.
-The leverage score is the resulting increase in $\phi_T^\cB$:
-\begin{equation}\label{eq:leverage}
-    \ell_e = \phi_T^\cB\!\left(\bm{M}_\cG - \bm{J}_e^\top\bm{\Lambda}_e\bm{J}_e\right) - \phi_T^\cB\!\left(\bm{M}_\cG\right) \;\geq\; 0.
-\end{equation}
-The inequality holds because removing a PSD term from the precision matrix can only weaken inference's ability to resolve the fixed boundary target.
-High leverage means edge $e$ provides directions essential for resolving boundary errors; low leverage means the edge is redundant.
-
-All $M$ evaluations use the same $\bm{M}_\cG^{-1}$ and the same $\bb_\cB$, are independent, and are parallelisable.
-When an edge contributes a single correction direction $\bu$, the leverage on boundary residual $\bv$ reduces to
-\begin{equation}\label{eq:rank1}
-    \ell_e = \frac{(\bv^\top\bm{M}_\cG^{-1}\bu)^2}{1 - \bu^\top\bm{M}_\cG^{-1}\bu}\,,
-\end{equation}
-where the numerator measures how much of the resolved boundary residual depends on this edge and the denominator captures the degree to which other edges can compensate.
-
-\subsection{Pruning algorithm}\label{sec:pruning}
-
-The non-negativity of leverage scores makes pruning well-posed: every removal increases $\phi_T^\cB$ (or leaves it unchanged), so the score curve is monotonically non-decreasing as edges are removed.
-The pruning algorithm traces this curve and stops when the score exceeds a tolerance.
-
-\begin{algorithm}[t]
-\caption{Inference-Aware Structure Reduction}
-\label{alg:reduce}
-\begin{algorithmic}[1]
-\REQUIRE Supergraph $\cG_{\mathrm{full}}$ with $M$ edges, data batch $\{(\bx_n,\by_n)\}_{n=1}^B$
-\REQUIRE Inference steps $T$, prune fraction $\rho$, tolerance $\delta$
-\STATE Draw $\btheta\sim p(\btheta)$ (or load pretrained); run $T$ inference steps on $\cG_{\mathrm{full}}$
-\STATE Record boundary residual $\bb_\cB$ and Jacobians $\bm{J}_e$, curvatures $\bm{\Lambda}_e$ for all $e$
-\STATE Form $\bm{M}_\cG = \sum_e \bm{J}_e^\top\bm{\Lambda}_e\bm{J}_e + \varepsilon\bm{I}$; compute $\bm{M}_\cG^{-1}$
-\STATE $\phi_{\mathrm{prev}} \leftarrow \phi_T^\cB(\bm{M}_\cG)$
-\REPEAT
-    \STATE Compute leverage $\ell_e$ for all active edges $e$ via~\eqref{eq:leverage}
-    \STATE Identify lowest-leverage fraction $\rho$ of active edges
-    \FOR{each edge $e$ in removal set (ascending leverage)}
-        \STATE Update $\bm{M}_\cG^{-1}$ via Woodbury downdate~\eqref{eq:downdate}
-        \STATE Remove $e$ from active edge set
-    \ENDFOR
-    \STATE $\phi_{\mathrm{curr}} \leftarrow \phi_T^\cB(\bm{M}_\cG)$
-    \IF{$\phi_{\mathrm{curr}} - \phi_{\mathrm{prev}} > \delta$}
-        \STATE Restore last removal batch; \textbf{break}
-    \ENDIF
-    \STATE $\phi_{\mathrm{prev}} \leftarrow \phi_{\mathrm{curr}}$
-\UNTIL{no active edges remain below leverage threshold}
-\RETURN Reduced graph $\cG^*$, leverage scores, decomposed $\phi_T^\cB$
-\end{algorithmic}
-\end{algorithm}
-
-\paragraph{Why boundary scoring makes pruning well-posed.}
-Without the boundary restriction, removing an edge removes both its correction capacity \emph{and} the prediction errors it generates at random initialisation.
-Since random edges typically produce large errors, removal can decrease the total profiled energy, and the algorithm prunes to a trivial graph.
-Restricting evaluation to boundary edges eliminates this pathology: internal edges contribute only capacity (through $\bm{\Gamma}_\cG$), never evaluation error (through $\bb_\cB$).
-Removing an internal edge weakens the preconditioner without reducing the target, so $\phi_T^\cB$ can only increase.
-Removing a boundary edge eliminates one source of evaluation error but also removes its contribution to the preconditioner; its leverage score captures the net effect, which is non-negative by construction.
-
-\paragraph{Computational cost.}
-The dominant cost is the initial $O(D^3)$ inversion.
-Each pruning round costs $O(|\text{batch}| \cdot D^2 \cdot d_{\mathrm{tgt}})$ for Woodbury updates plus $O(M \cdot D^2 \cdot d_{\mathrm{tgt}})$ for leverage recomputation.
-For $D \lesssim 10{,}000$ and $M \lesssim 1{,}000$, the entire procedure completes in seconds.
-For larger $D$, the explicit inverse can be replaced by conjugate gradient solves, with leverage scores estimated via stochastic trace estimators~\citep{hutchinson1989stochastic}.
-
-\subsection{Connection to matching pursuit}\label{sec:pursuit}
-
-The \emph{forward} direction of structure search---adding edges to a minimal graph---is matching pursuit~\citep{mallat1993matching} in Jacobian space: the dictionary is the set of candidate correction operators; the signal is the boundary coverage gap $\bb_\cB^\perp$; each step selects the atom best aligned with the unexplained boundary residual.
-The backward direction (Algorithm~\ref{alg:reduce}) is the same problem viewed from the other end.
-Both exploit the additive PSD structure of the precision matrix.
-The backward direction is preferred because it starts with full information about edge interactions: leverage scores account for redundancy automatically, and the exploration problem that plagues forward search---candidates touching disconnected variables have zero gain---is absent.
-
-%═══════════════════════════════════════════════════════════════
-\section{How Structure Enters the Precision Matrix}\label{sec:structure}
-%═══════════════════════════════════════════════════════════════
-
-Each edge contributes a PSD term $\bm{J}_e^\top\bm{\Lambda}_e\bm{J}_e$ whose algebraic structure reflects the transform, whose weighting reflects the energy, and whose coupling with other terms reflects the topology.
-We trace these contributions at random initialisation through the coverage/conditioning decomposition, drawing on standard results in random matrix theory~\citep{marchenko1967distribution,gray2006toeplitz}.
-
-\paragraph{Depth.}
-A chain $\bv_0\to\cdots\to\bv_L$ produces effective Jacobians involving products of per-layer matrices whose singular values spread exponentially with depth: $\sigma_{\max}/\sigma_{\min}\sim e^{cL}$.
-Most eigenvalues of $\bm{\Gamma}_\cG$ fall below the spectral gate---the inference-side analogue of vanishing gradients.
-
-\paragraph{Skip connections.}
-A skip edge $\bv_i\to\bv_j$ adds a PSD term with $O(1)$ eigenvalues at random init---no multiplicative composition.
-It raises the smallest eigenvalues of $\bm{\Gamma}_\cG$: an additive correction to the preconditioner's spectral spread.
-Skip connections in deep graphs will have high leverage because they provide the directions that the chain alone cannot resolve within budget.
-
-\paragraph{Parallel edges.}
-$K$ parallel edges contribute $K$ independent PSD terms whose summed eigenvalues concentrate more tightly around the mean.
-Each individual parallel edge has low leverage (redundant with its neighbours); the pruning algorithm naturally thins them to the minimum set needed for adequate conditioning.
-
-\paragraph{Dense transforms.}
-$f(\bv)=\bm{W}\bv$ with i.i.d.\ entries gives a Wishart contribution $\bm{W}^\top\bm{W}$ with isotropic eigenvectors.
-No direction is preferred; dense transforms provide capacity without structural prior.
-
-\paragraph{Convolutional transforms.}
-$f(\bv)=\bm{W}*\bv$ gives a block-circulant Jacobian diagonalised by the DFT regardless of filter values.
-The precision contribution has eigenvectors fixed to the Fourier basis; only eigenvalues are random.
-On natural images, this separates signal from noise in a way isotropic eigenvectors cannot.
-
-\paragraph{Attention.}
-At random init with large key dimension, the Jacobian approximates mean-pooling composed with a random value projection, emphasising position-averaged correction directions.
-
-\paragraph{Recurrence.}
-The Jacobian from time $t$ to $T$ involves products $\prod_{s=t}^{T-1}\mathrm{diag}(\sigma'_s)\bm{W}_h$ whose singular values decay with lag; long-range modes are suppressed.
-Gated variants introduce additive paths that preserve singular values.
-
-\paragraph{Energy functions.}
-Squared error gives $\bm{\Lambda}_e=\bm{I}$ (isotropic).
-Cross-entropy gives $\bm{\Lambda}_e=\mathrm{diag}(\bm{p})-\bm{p}\bm{p}^\top$ (PSD on the simplex tangent space).
-
-%═══════════════════════════════════════════════════════════════
-\section{Related Work}\label{sec:related}
-%═══════════════════════════════════════════════════════════════
-
-\paragraph{Bayesian model reduction.}
-BMR~\citep{friston2018bmr,friston2016group} fits a full model via variational Bayes, then analytically scores every reduced model that differs only in its priors.
-Our approach inherits the \emph{invert-once-reduce-many} structure but operates on graph structure rather than parameter priors, and scores by boundary profiled energy rather than variational free energy.
-The key difference is which end of the spectrum is penalised: BMR's Occam factor penalises large eigenvalues (statistical over-commitment), while the conditioning penalty penalises small eigenvalues (computational inaccessibility).
-BMR has recently been applied to neural network pruning~\citep{beckers2024bmrs}, where parameters are removed by shrinking their prior variance to zero.
-Our method removes \emph{edges}---the natural structural unit for models whose energy decomposes over factors.
-
-\paragraph{Structure learning in graphical models.}
-The precision matrix and its decomposition over cliques are foundational to Gaussian graphical models~\citep{lauritzen1996graphical}; score-based structure learning selects graphs by penalised likelihood or independence tests~\citep{koller2009pgm}.
-Our approach uses the same object in a different regime: random initialisation of neural transforms, finite-step inference, and heterogeneous parameterised factors.
-
-\paragraph{Neural architecture search without training.}
-The Neural Tangent Kernel~\citep{jacot2018neural} linearises around parameters and produces a Gram matrix governing \emph{learning} dynamics.
-TE-NAS~\citep{chen2021tenas} and NASI~\citep{shu2022nasi} use NTK-derived quantities to rank architectures without training, but \citet{mok2022demystifying} show modern architectures leave the NTK regime quickly, and \citet{zhou2024vintk} find NTK metrics ineffective on Vision Transformers because the kernel conflates attention and MLP spectra through end-to-end composition.
-The precision-matrix approach avoids this: it decomposes over local factors, linearises ${\sim}20$ inference steps rather than $10^3$--$10^4$ training steps, and discriminates through both coverage and conditioning in a single score.
-
-\paragraph{Sparse approximation.}
-The forward direction of structure search (Section~\ref{sec:pursuit}) is matching pursuit~\citep{mallat1993matching} in Jacobian space.
-Compressed sensing theory~\citep{tropp2004greed} provides convergence guarantees under dictionary coherence conditions whose applicability to neural Jacobian dictionaries is an open question.
-
-%═══════════════════════════════════════════════════════════════
-\section{Discussion}\label{sec:discussion}
-%═══════════════════════════════════════════════════════════════
-
-We have developed a structure-learning method for energy-based models that applies the logic of Bayesian model reduction to graph structure, scored by boundary profiled energy rather than variational free energy.
-The core mechanism is the additive decomposition of the inference precision matrix over edges, which gives: a decomposed score separating coverage from conditioning, per-edge leverage scores from a single matrix inverse, and an efficient pruning algorithm via Woodbury downdates---with the guarantee that leverage scores are non-negative, making greedy pruning well-posed.
-
-The boundary evaluation principle---all edges shape inference, only boundary edges define the task---resolves the tension between an edge's dual role as both error source and correction mechanism.
-At random initialisation, where internal prediction errors are large and uninformative, this distinction is essential; on pretrained models, where internal errors are small and structured, the distinction becomes less critical but remains formally correct.
-
-The framework applies to any model with an energy that decomposes over local factors.
-At random initialisation, it selects graph structure before any training.
-On a pretrained model, the same algorithm performs post-hoc pruning, identifying edges whose contributions are redundant or below the spectral gate.
-
-The framework makes concrete predictions.
-The boundary profiled energy should correlate with trained accuracy on NAS benchmarks.
-The energy gap should track inductive bias: convolutional edges favoured on images, attention on sequences.
-Skip connections should have high leverage in deep graphs.
-Leverage-based pruning should outperform random pruning and match or exceed BMR-based pruning on energy-based models.
-The method should remain discriminative on heterogeneous search spaces where existing training-free metrics degrade.
-
-%═══════════════════════════════════════════════════════════════
-
-\bibliographystyle{plainnat}
-\begin{thebibliography}{17}
-
-\bibitem[Bai et~al.(2019)]{bai2019deep}
-S.~Bai, J.~Z.~Kolter, and V.~Koltun.
-\newblock Deep equilibrium models.
-\newblock In \emph{NeurIPS}, 2019.
-
-\bibitem[Beckers et~al.(2024)]{beckers2024bmrs}
-S.~Beckers, J.~Jantre, and others.
-\newblock {BMRS}: {B}ayesian model reduction for structured pruning.
-\newblock \emph{arXiv:2406.01345}, 2024.
-
-\bibitem[Chen et~al.(2021)]{chen2021tenas}
-W.~Chen, X.~Gong, and Z.~Wang.
-\newblock Neural architecture search on {ImageNet} in four {GPU} hours: A theoretically inspired perspective.
-\newblock In \emph{ICLR}, 2021.
-
-\bibitem[Friston et~al.(2016)]{friston2016group}
-K.~J.~Friston, V.~Litvak, A.~Oswal, A.~Razi, K.~E.~Stephan, B.~C.~M.~van Wijk, G.~Ziegler, and P.~Zeidman.
-\newblock {B}ayesian model reduction and empirical {B}ayes for group ({DCM}) studies.
-\newblock \emph{NeuroImage}, 128:413--431, 2016.
-
-\bibitem[Friston et~al.(2018)]{friston2018bmr}
-K.~Friston, T.~Parr, and P.~Zeidman.
-\newblock {B}ayesian model reduction.
-\newblock \emph{arXiv:1805.07092}, 2018.
-
-\bibitem[Gray(2006)]{gray2006toeplitz}
-R.~M.~Gray.
-\newblock \emph{Toeplitz and Circulant Matrices: A Review}.
-\newblock Now Publishers, 2006.
-
-\bibitem[Hutchinson(1989)]{hutchinson1989stochastic}
-M.~F.~Hutchinson.
-\newblock A stochastic estimator of the trace of the influence matrix.
-\newblock \emph{Commun.\ Statist.---Simula.}, 18(3):1059--1076, 1989.
-
-\bibitem[Jacot et~al.(2018)]{jacot2018neural}
-A.~Jacot, F.~Gabriel, and C.~Hongler.
-\newblock Neural tangent kernel: Convergence and generalization in neural networks.
-\newblock In \emph{NeurIPS}, 2018.
-
-\bibitem[Koller and Friedman(2009)]{koller2009pgm}
-D.~Koller and N.~Friedman.
-\newblock \emph{Probabilistic Graphical Models: Principles and Techniques}.
-\newblock MIT Press, 2009.
-
-\bibitem[Lauritzen(1996)]{lauritzen1996graphical}
-S.~L.~Lauritzen.
-\newblock \emph{Graphical Models}.
-\newblock Oxford University Press, 1996.
-
-\bibitem[Mallat and Zhang(1993)]{mallat1993matching}
-S.~Mallat and Z.~Zhang.
-\newblock Matching pursuits with time-frequency dictionaries.
-\newblock \emph{IEEE TSP}, 41(12):3397--3415, 1993.
-
-\bibitem[Marchenko and Pastur(1967)]{marchenko1967distribution}
-V.~A.~Marchenko and L.~A.~Pastur.
-\newblock Distribution of eigenvalues for some sets of random matrices.
-\newblock \emph{Matematicheskii Sbornik}, 114(4):507--536, 1967.
-
-\bibitem[Minka(2001)]{minka2001ep}
-T.~P.~Minka.
-\newblock Expectation propagation for approximate {Bayesian} inference.
-\newblock In \emph{UAI}, 2001.
-
-\bibitem[Mok et~al.(2022)]{mok2022demystifying}
-J.~Mok, B.~Na, H.~Choe, and S.~Yoon.
-\newblock Demystifying the neural tangent kernel from a practical perspective: Can it be trusted for {NAS} without training?
-\newblock In \emph{CVPR}, 2022.
-
-\bibitem[Ramsauer et~al.(2021)]{ramsauer2021hopfield}
-H.~Ramsauer et~al.
-\newblock Hopfield networks is all you need.
-\newblock In \emph{ICLR}, 2021.
-
-\bibitem[Rao and Ballard(1999)]{rao1999predictive}
-R.~P.~N.~Rao and D.~H.~Ballard.
-\newblock Predictive coding in the visual cortex.
-\newblock \emph{Nature Neuroscience}, 2(1):79--87, 1999.
-
-\bibitem[Shu et~al.(2022)]{shu2022nasi}
-Y.~Shu, Z.~Cai, Z.~Dai, T.~Ooi, and B.~K.~H.~Low.
-\newblock {NASI}: Label- and data-agnostic neural architecture search at initialization.
-\newblock In \emph{ICLR}, 2022.
-
-\bibitem[Tropp(2004)]{tropp2004greed}
-J.~A.~Tropp.
-\newblock Greed is good: Algorithmic results for sparse approximation.
-\newblock \emph{IEEE Trans.\ Inform.\ Theory}, 50(10):2231--2242, 2004.
-
-\bibitem[Whittington and Bogacz(2017)]{whittington2017approximation}
-J.~C.~R.~Whittington and R.~Bogacz.
-\newblock An approximation of the error backpropagation algorithm in a predictive coding network with local {Hebbian} synaptic plasticity.
-\newblock \emph{Neural Computation}, 29(5):1229--1262, 2017.
-
-\bibitem[Winn and Bishop(2005)]{winn2005variational}
-J.~Winn and C.~M.~Bishop.
-\newblock Variational message passing.
-\newblock \emph{JMLR}, 6:661--694, 2005.
-
-\bibitem[Zhou et~al.(2024)]{zhou2024vintk}
-W.~Zhou, J.~Huang, and others.
-\newblock When training-free {NAS} meets vision transformers: A neural tangent kernel perspective.
-\newblock In \emph{DAC}, 2024.
-
-\end{thebibliography}
-
-%═══════════════════════════════════════════════════════════════
-\newpage
-\begin{appendices}
-
-\section{Gauss--Newton Decomposition}\label{app:hessian}
-
-For a single energy term $\E_i(\bv_i,\hat{\bv}_i)$ with prediction $\hat{\bv}_i = f_e(\bv_{\mathrm{src}(e)})$, the second derivative with respect to any free variable block $\bz$ is
-\begin{equation}
-    \nabla^2_{\bz}\E_i = \bm{J}_e^{(\bz)\top}(\nabla^2_{\hat{v}}\E_i)\bm{J}_e^{(\bz)} + \sum_j(\nabla_{\hat{v}_j}\E_i)\nabla^2_{\bz}[f_e]_j,
-\end{equation}
-where $\bm{J}_e^{(\bz)}=\partial f_e/\partial\bz$.
-The first term is the Gauss--Newton part: $\bm{J}_e^{(\bz)\top}\bm{\Lambda}_e\bm{J}_e^{(\bz)}$ with $\bm{\Lambda}_e = \nabla^2_{\hat{v}}\E_i\succeq 0$.
-The second term involves second derivatives of the transform weighted by the energy gradient, and is neglected when either (a)~prediction errors $\nabla_{\hat{v}}\E_i$ are small, or (b)~transforms are close to linear.
-At random initialisation neither condition is guaranteed; the approximation is a modelling choice whose quality improves as inference reduces residuals.
-Setting $\bz=\bx$ and summing over edges gives~\eqref{eq:hessian}.
-
-\section{Task Residual}\label{app:residual}
-
-$\bm{A}_\cG\in\R^{m\times D}$ maps state perturbations $\delta\bx$ to changes in curvature-weighted prediction space, with block row $[\bm{A}_\cG]_e = \bm{\Lambda}_e^{1/2}\bm{J}_e$.
-The boundary residual $\bb_\cB\in\R^{m_\cB}$ stacks curvature-weighted prediction errors $\bm{\Lambda}_e^{1/2}(f_e(\bv_{\mathrm{src}}) - \bv_{\mathrm{tgt}(e)})$ for boundary edges $e \in \cB$ only.
-
-\section{Spectral Filter}\label{app:spectral}
-
-On the quadratic model $E = c + \frac{1}{2}\|\bm{A}\delta\bx-\bb\|^2$ with $\bm{\Gamma}=\bm{A}^\top\bm{A}=\bm{U\Lambda U}^\top$, gradient descent from $\delta\bx^{(0)}=0$ gives $\delta\bx^{(T)}=\bm{U}[\bm{I}-(\bm{I}-\eta\bm{\Lambda})^T]\bm{\Lambda}^{-1}\bm{U}^\top\bm{A}^\top\bb$.
-
-For boundary evaluation, let $\bm{A}_\cB$ denote the boundary rows of $\bm{A}$.
-The boundary residual after $T$ steps is $\bb_\cB^{(T)} = \bb_\cB - \bm{A}_\cB\delta\bx^{(T)}$.
-The full inference dynamics use all rows of $\bm{A}$ (all edges contribute to $\bm{\Gamma}$ and hence to $\delta\bx^{(T)}$), but the evaluation restricts to boundary rows.
-Decomposing $\bb_\cB = \bm{A}_\cB\bm{U}\bc_\cB + \bb_\cB^\perp$ with $\bb_\cB^\perp \perp \mathrm{col}(\bm{A}_\cB)$:
-\begin{equation}
-    \phi_T^\cB = \|\bb_\cB^\perp\|^2 + \sum_{i=1}^D(1-\eta\lambda_i)^{2T}c_{\cB,i}^2,
-\end{equation}
-where the eigenvalues $\lambda_i$ are those of the \emph{full} precision matrix $\bm{\Gamma}_\cG$ (all edges), and $c_{\cB,i}$ are the boundary coefficients.
-The key asymmetry: the preconditioner uses all edges; the target uses only boundary edges.
-
-\end{appendices}
-
-\end{document}s contribution to resolving task-relevant boundary variance.
-When $\bm{\Sigma}_{\mathrm{task}} \approx \sigma^2\bm{I}$ (isotropic task), this reduces to the standard trace proxy $\mathrm{tr}(\bm{\Lambda}_e\bm{J}_e\bm{M}_\cG^{-1}\bm{J}_e^\top)$.
-In practice, estimating~\eqref{eq:proxy} via the sample average of per-sample leverage scores~\eqref{eq:rank1} avoids forming $\hat{\bm{\Sigma}}_{\mathrm{task}}$ explicitly.
-
-\subsection{Pruning algorithm}\label{sec:pruning}
-
-The non-negativity of leverage scores makes pruning well-posed: every removal increases $\phi_T^\cB$ (or leaves it unchanged), so the score curve is monotonically non-decreasing as edges are removed.
-The pruning algorithm traces this curve and stops when the score exceeds a tolerance.
-
-\begin{algorithm}[t]
-\caption{Inference-Aware Structure Reduction}
-\label{alg:reduce}
-\begin{algorithmic}[1]
-\REQUIRE Supergraph $\cG_{\mathrm{full}}$ with $M$ edges, data batch $\{(\bx_n,\by_n)\}_{n=1}^B$
-\REQUIRE Inference steps $T$, prune fraction $\rho$, tolerance $\delta$
-\STATE Draw $\btheta\sim p(\btheta)$ (or load pretrained); run $T$ inference steps on $\cG_{\mathrm{full}}$
-\STATE Record boundary residual $\bb_\cB$ and Jacobians $\bm{J}_e$, curvatures $\bm{\Lambda}_e$ for all $e$
-\STATE Form $\bm{M}_\cG = \sum_e \bm{J}_e^\top\bm{\Lambda}_e\bm{J}_e + \varepsilon\bm{I}$; compute $\bm{M}_\cG^{-1}$
-\STATE $\phi_{\mathrm{prev}} \leftarrow \phi_T^\cB(\bm{M}_\cG)$
-\REPEAT
-    \STATE Compute leverage $\ell_e$ for all active edges $e$ via~\eqref{eq:leverage}
-    \STATE Identify lowest-leverage fraction $\rho$ of active edges
-    \FOR{each edge $e$ in removal set (ascending leverage)}
-        \STATE Update $\bm{M}_\cG^{-1}$ via Woodbury downdate~\eqref{eq:downdate}
-        \STATE Remove $e$ from active edge set
-    \ENDFOR
-    \STATE $\phi_{\mathrm{curr}} \leftarrow \phi_T^\cB(\bm{M}_\cG)$
-    \IF{$\phi_{\mathrm{curr}} - \phi_{\mathrm{prev}} > \delta$}
-        \STATE Restore last removal batch; \textbf{break}
-    \ENDIF
-    \STATE $\phi_{\mathrm{prev}} \leftarrow \phi_{\mathrm{curr}}$
-\UNTIL{no active edges remain below leverage threshold}
-\RETURN Reduced graph $\cG^*$, leverage scores, decomposed $\phi_T^\cB$
-\end{algorithmic}
-\end{algorithm}
-
-\paragraph{Why boundary scoring makes pruning well-posed.}
-Without the boundary restriction, removing an edge removes both its correction capacity \emph{and} the prediction errors it generates at random initialisation.
-Since random edges typically produce large errors, removal can decrease the total profiled energy, and the algorithm prunes to a trivial graph.
-Restricting evaluation to boundary edges eliminates this pathology: internal edges contribute only capacity (through $\bm{\Gamma}_\cG$), never evaluation error (through $\bb_\cB$).
-Removing an internal edge weakens the preconditioner without reducing the target, so $\phi_T^\cB$ can only increase.
-Removing a boundary edge eliminates one source of evaluation error but also removes its contribution to the preconditioner; its leverage score captures the net effect, which is non-negative by construction.
-
-\paragraph{Computational cost.}
-The dominant cost is the initial $O(D^3)$ inversion.
-Each pruning round costs $O(|\text{batch}| \cdot D^2 \cdot d_{\mathrm{tgt}})$ for Woodbury updates plus $O(M \cdot D^2 \cdot d_{\mathrm{tgt}})$ for leverage recomputation.
-For $D \lesssim 10{,}000$ and $M \lesssim 1{,}000$, the entire procedure completes in seconds.
-For larger $D$, the explicit inverse can be replaced by conjugate gradient solves, with leverage scores estimated via stochastic trace estimators~\citep{hutchinson1989stochastic}.
-
-\subsection{Connection to matching pursuit}\label{sec:pursuit}
-
-The \emph{forward} direction of structure search---adding edges to a minimal graph---is matching pursuit~\citep{mallat1993matching} in Jacobian space: the dictionary is the set of candidate correction operators; the signal is the boundary coverage gap $\bb_\cB^\perp$; each step selects the atom best aligned with the unexplained boundary residual.
-The backward direction (Algorithm~\ref{alg:reduce}) is the same problem viewed from the other end.
-Both exploit the additive PSD structure of the precision matrix.
-The backward direction is preferred because it starts with full information about edge interactions: leverage scores account for redundancy automatically, and the exploration problem that plagues forward search---candidates touching disconnected variables have zero gain---is absent.
-
-%═══════════════════════════════════════════════════════════════
-\section{How Structure Enters the Precision Matrix}\label{sec:structure}
-%═══════════════════════════════════════════════════════════════
-
-Each edge contributes a PSD term $\bm{J}_e^\top\bm{\Lambda}_e\bm{J}_e$ whose algebraic structure reflects the transform, whose weighting reflects the energy, and whose coupling with other terms reflects the topology.
-We trace these contributions at random initialisation through the coverage/conditioning decomposition, drawing on standard results in random matrix theory~\citep{marchenko1967distribution,gray2006toeplitz}.
-
-\paragraph{Depth.}
-A chain $\bv_0\to\cdots\to\bv_L$ produces effective Jacobians involving products of per-layer matrices whose singular values spread exponentially with depth: $\sigma_{\max}/\sigma_{\min}\sim e^{cL}$.
-Most eigenvalues of $\bm{\Gamma}_\cG$ fall below the spectral gate---the inference-side analogue of vanishing gradients.
-
-\paragraph{Skip connections.}
-A skip edge $\bv_i\to\bv_j$ adds a PSD term with $O(1)$ eigenvalues at random init---no multiplicative composition.
-It raises the smallest eigenvalues of $\bm{\Gamma}_\cG$: an additive correction to the preconditioner's spectral spread.
-Skip connections in deep graphs will have high leverage because they provide the directions that the chain alone cannot resolve within budget.
-
-\paragraph{Parallel edges.}
-$K$ parallel edges contribute $K$ independent PSD terms whose summed eigenvalues concentrate more tightly around the mean.
-Each individual parallel edge has low leverage (redundant with its neighbours); the pruning algorithm naturally thins them to the minimum set needed for adequate conditioning.
-
-\paragraph{Dense transforms.}
-$f(\bv)=\bm{W}\bv$ with i.i.d.\ entries gives a Wishart contribution $\bm{W}^\top\bm{W}$ with isotropic eigenvectors.
-No direction is preferred; dense transforms provide capacity without structural prior.
-
-\paragraph{Convolutional transforms.}
-$f(\bv)=\bm{W}*\bv$ gives a block-circulant Jacobian diagonalised by the DFT regardless of filter values.
-The precision contribution has eigenvectors fixed to the Fourier basis; only eigenvalues are random.
-On natural images, this separates signal from noise in a way isotropic eigenvectors cannot.
-
-\paragraph{Attention.}
-At random init with large key dimension, the Jacobian approximates mean-pooling composed with a random value projection, emphasising position-averaged correction directions.
-
-\paragraph{Recurrence.}
-The Jacobian from time $t$ to $T$ involves products $\prod_{s=t}^{T-1}\mathrm{diag}(\sigma'_s)\bm{W}_h$ whose singular values decay with lag; long-range modes are suppressed.
-Gated variants introduce additive paths that preserve singular values.
-
-\paragraph{Energy functions.}
-Squared error gives $\bm{\Lambda}_e=\bm{I}$ (isotropic).
-Cross-entropy gives $\bm{\Lambda}_e=\mathrm{diag}(\bm{p})-\bm{p}\bm{p}^\top$ (PSD on the simplex tangent space).
-
-%═══════════════════════════════════════════════════════════════
-\section{Related Work}\label{sec:related}
-%═══════════════════════════════════════════════════════════════
-
-\paragraph{Bayesian model reduction.}
-BMR~\citep{friston2018bmr,friston2016group} fits a full model via variational Bayes, then analytically scores every reduced model that differs only in its priors.
-Our approach inherits the \emph{invert-once-reduce-many} structure but operates on graph structure rather than parameter priors, and scores by boundary profiled energy rather than variational free energy.
-The key difference is which end of the spectrum is penalised: BMR's Occam factor penalises large eigenvalues (statistical over-commitment), while the conditioning penalty penalises small eigenvalues (computational inaccessibility).
-BMR has recently been applied to neural network pruning~\citep{beckers2024bmrs}, where parameters are removed by shrinking their prior variance to zero.
-Our method removes \emph{edges}---the natural structural unit for models whose energy decomposes over factors.
-
-\paragraph{Structure learning in graphical models.}
-The precision matrix and its decomposition over cliques are foundational to Gaussian graphical models~\citep{lauritzen1996graphical}; score-based structure learning selects graphs by penalised likelihood or independence tests~\citep{koller2009pgm}.
-Our approach uses the same object in a different regime: random initialisation of neural transforms, finite-step inference, and heterogeneous parameterised factors.
-
-\paragraph{Neural architecture search without training.}
-The Neural Tangent Kernel~\citep{jacot2018neural} linearises around parameters and produces a Gram matrix governing \emph{learning} dynamics.
-TE-NAS~\citep{chen2021tenas} and NASI~\citep{shu2022nasi} use NTK-derived quantities to rank architectures without training, but \citet{mok2022demystifying} show modern architectures leave the NTK regime quickly, and \citet{zhou2024vintk} find NTK metrics ineffective on Vision Transformers because the kernel conflates attention and MLP spectra through end-to-end composition.
-The precision-matrix approach avoids this: it decomposes over local factors, linearises ${\sim}20$ inference steps rather than $10^3$--$10^4$ training steps, and discriminates through both coverage and conditioning in a single score.
-
-\paragraph{Sparse approximation.}
-The forward direction of structure search (Section~\ref{sec:pursuit}) is matching pursuit~\citep{mallat1993matching} in Jacobian space.
-Compressed sensing theory~\citep{tropp2004greed} provides convergence guarantees under dictionary coherence conditions whose applicability to neural Jacobian dictionaries is an open question.
-
-%═══════════════════════════════════════════════════════════════
-\section{Discussion}\label{sec:discussion}
-%═══════════════════════════════════════════════════════════════
-
-We have developed a structure-learning method for energy-based models that applies the logic of Bayesian model reduction to graph structure, scored by boundary profiled energy rather than variational free energy.
-The core mechanism is the additive decomposition of the inference precision matrix over edges, which gives: a decomposed score separating coverage from conditioning, per-edge leverage scores from a single matrix inverse, and an efficient pruning algorithm via Woodbury downdates---with the guarantee that leverage scores are non-negative, making greedy pruning well-posed.
-
-The boundary evaluation principle---all edges shape inference, only boundary edges define the task---resolves the tension between an edge's dual role as both error source and correction mechanism.
-At random initialisation, where internal prediction errors are large and uninformative, this distinction is essential; on pretrained models, where internal errors are small and structured, the distinction becomes less critical but remains formally correct.
-
-The framework applies to any model with an energy that decomposes over local factors.
-At random initialisation, it selects graph structure before any training.
-On a pretrained model, the same algorithm performs post-hoc pruning, identifying edges whose contributions are redundant or below the spectral gate.
-
-The framework makes concrete predictions.
-The boundary profiled energy should correlate with trained accuracy on NAS benchmarks.
-The energy gap should track inductive bias: convolutional edges favoured on images, attention on sequences.
-Skip connections should have high leverage in deep graphs.
-Leverage-based pruning should outperform random pruning and match or exceed BMR-based pruning on energy-based models.
-The method should remain discriminative on heterogeneous search spaces where existing training-free metrics degrade.
-
-%═══════════════════════════════════════════════════════════════
-
-\bibliographystyle{plainnat}
-\begin{thebibliography}{17}
-
-\bibitem[Bai et~al.(2019)]{bai2019deep}
-S.~Bai, J.~Z.~Kolter, and V.~Koltun.
-\newblock Deep equilibrium models.
-\newblock In \emph{NeurIPS}, 2019.
-
-\bibitem[Beckers et~al.(2024)]{beckers2024bmrs}
-S.~Beckers, J.~Jantre, and others.
-\newblock {BMRS}: {B}ayesian model reduction for structured pruning.
-\newblock \emph{arXiv:2406.01345}, 2024.
-
-\bibitem[Chen et~al.(2021)]{chen2021tenas}
-W.~Chen, X.~Gong, and Z.~Wang.
-\newblock Neural architecture search on {ImageNet} in four {GPU} hours: A theoretically inspired perspective.
-\newblock In \emph{ICLR}, 2021.
-
-\bibitem[Friston et~al.(2016)]{friston2016group}
-K.~J.~Friston, V.~Litvak, A.~Oswal, A.~Razi, K.~E.~Stephan, B.~C.~M.~van Wijk, G.~Ziegler, and P.~Zeidman.
-\newblock {B}ayesian model reduction and empirical {B}ayes for group ({DCM}) studies.
-\newblock \emph{NeuroImage}, 128:413--431, 2016.
-
-\bibitem[Friston et~al.(2018)]{friston2018bmr}
-K.~Friston, T.~Parr, and P.~Zeidman.
-\newblock {B}ayesian model reduction.
-\newblock \emph{arXiv:1805.07092}, 2018.
-
-\bibitem[Gray(2006)]{gray2006toeplitz}
-R.~M.~Gray.
-\newblock \emph{Toeplitz and Circulant Matrices: A Review}.
-\newblock Now Publishers, 2006.
-
-\bibitem[Hutchinson(1989)]{hutchinson1989stochastic}
-M.~F.~Hutchinson.
-\newblock A stochastic estimator of the trace of the influence matrix.
-\newblock \emph{Commun.\ Statist.---Simula.}, 18(3):1059--1076, 1989.
-
-\bibitem[Jacot et~al.(2018)]{jacot2018neural}
-A.~Jacot, F.~Gabriel, and C.~Hongler.
-\newblock Neural tangent kernel: Convergence and generalization in neural networks.
-\newblock In \emph{NeurIPS}, 2018.
-
-\bibitem[Koller and Friedman(2009)]{koller2009pgm}
-D.~Koller and N.~Friedman.
-\newblock \emph{Probabilistic Graphical Models: Principles and Techniques}.
-\newblock MIT Press, 2009.
-
-\bibitem[Lauritzen(1996)]{lauritzen1996graphical}
-S.~L.~Lauritzen.
-\newblock \emph{Graphical Models}.
-\newblock Oxford University Press, 1996.
-
-\bibitem[Mallat and Zhang(1993)]{mallat1993matching}
-S.~Mallat and Z.~Zhang.
-\newblock Matching pursuits with time-frequency dictionaries.
-\newblock \emph{IEEE TSP}, 41(12):3397--3415, 1993.
-
-\bibitem[Marchenko and Pastur(1967)]{marchenko1967distribution}
-V.~A.~Marchenko and L.~A.~Pastur.
-\newblock Distribution of eigenvalues for some sets of random matrices.
-\newblock \emph{Matematicheskii Sbornik}, 114(4):507--536, 1967.
-
-\bibitem[Minka(2001)]{minka2001ep}
-T.~P.~Minka.
-\newblock Expectation propagation for approximate {Bayesian} inference.
-\newblock In \emph{UAI}, 2001.
-
-\bibitem[Mok et~al.(2022)]{mok2022demystifying}
-J.~Mok, B.~Na, H.~Choe, and S.~Yoon.
-\newblock Demystifying the neural tangent kernel from a practical perspective: Can it be trusted for {NAS} without training?
-\newblock In \emph{CVPR}, 2022.
-
-\bibitem[Ramsauer et~al.(2021)]{ramsauer2021hopfield}
-H.~Ramsauer et~al.
-\newblock Hopfield networks is all you need.
-\newblock In \emph{ICLR}, 2021.
-
-\bibitem[Rao and Ballard(1999)]{rao1999predictive}
-R.~P.~N.~Rao and D.~H.~Ballard.
-\newblock Predictive coding in the visual cortex.
-\newblock \emph{Nature Neuroscience}, 2(1):79--87, 1999.
-
-\bibitem[Shu et~al.(2022)]{shu2022nasi}
-Y.~Shu, Z.~Cai, Z.~Dai, T.~Ooi, and B.~K.~H.~Low.
-\newblock {NASI}: Label- and data-agnostic neural architecture search at initialization.
-\newblock In \emph{ICLR}, 2022.
-
-\bibitem[Tropp(2004)]{tropp2004greed}
-J.~A.~Tropp.
-\newblock Greed is good: Algorithmic results for sparse approximation.
-\newblock \emph{IEEE Trans.\ Inform.\ Theory}, 50(10):2231--2242, 2004.
-
-\bibitem[Whittington and Bogacz(2017)]{whittington2017approximation}
-J.~C.~R.~Whittington and R.~Bogacz.
-\newblock An approximation of the error backpropagation algorithm in a predictive coding network with local {Hebbian} synaptic plasticity.
-\newblock \emph{Neural Computation}, 29(5):1229--1262, 2017.
-
-\bibitem[Winn and Bishop(2005)]{winn2005variational}
-J.~Winn and C.~M.~Bishop.
-\newblock Variational message passing.
-\newblock \emph{JMLR}, 6:661--694, 2005.
-
-\bibitem[Zhou et~al.(2024)]{zhou2024vintk}
-W.~Zhou, J.~Huang, and others.
-\newblock When training-free {NAS} meets vision transformers: A neural tangent kernel perspective.
-\newblock In \emph{DAC}, 2024.
-
-\end{thebibliography}
-
-%═══════════════════════════════════════════════════════════════
-\newpage
-\begin{appendices}
-
-\section{Gauss--Newton Decomposition}\label{app:hessian}
-
-For a single energy term $\E_i(\bv_i,\hat{\bv}_i)$ with prediction $\hat{\bv}_i = f_e(\bv_{\mathrm{src}(e)})$, the second derivative with respect to any free variable block $\bz$ is
-\begin{equation}
-    \nabla^2_{\bz}\E_i = \bm{J}_e^{(\bz)\top}(\nabla^2_{\hat{v}}\E_i)\bm{J}_e^{(\bz)} + \sum_j(\nabla_{\hat{v}_j}\E_i)\nabla^2_{\bz}[f_e]_j,
-\end{equation}
-where $\bm{J}_e^{(\bz)}=\partial f_e/\partial\bz$.
-The first term is the Gauss--Newton part: $\bm{J}_e^{(\bz)\top}\bm{\Lambda}_e\bm{J}_e^{(\bz)}$ with $\bm{\Lambda}_e = \nabla^2_{\hat{v}}\E_i\succeq 0$.
-The second term involves second derivatives of the transform weighted by the energy gradient, and is neglected when either (a)~prediction errors $\nabla_{\hat{v}}\E_i$ are small, or (b)~transforms are close to linear.
-At random initialisation neither condition is guaranteed; the approximation is a modelling choice whose quality improves as inference reduces residuals.
-Setting $\bz=\bx$ and summing over edges gives~\eqref{eq:hessian}.
-
-\section{Task Residual}\label{app:residual}
-
-$\bm{A}_\cG\in\R^{m\times D}$ maps state perturbations $\delta\bx$ to changes in curvature-weighted prediction space, with block row $[\bm{A}_\cG]_e = \bm{\Lambda}_e^{1/2}\bm{J}_e$.
-The boundary residual $\bb_\cB\in\R^{m_\cB}$ stacks curvature-weighted prediction errors $\bm{\Lambda}_e^{1/2}(f_e(\bv_{\mathrm{src}}) - \bv_{\mathrm{tgt}(e)})$ for boundary edges $e \in \cB$ only.
-
-\section{Spectral Filter}\label{app:spectral}
-
-On the quadratic model $E = c + \frac{1}{2}\|\bm{A}\delta\bx-\bb\|^2$ with $\bm{\Gamma}=\bm{A}^\top\bm{A}=\bm{U\Lambda U}^\top$, gradient descent from $\delta\bx^{(0)}=0$ gives $\delta\bx^{(T)}=\bm{U}[\bm{I}-(\bm{I}-\eta\bm{\Lambda})^T]\bm{\Lambda}^{-1}\bm{U}^\top\bm{A}^\top\bb$.
-
-For boundary evaluation, let $\bm{A}_\cB$ denote the boundary rows of $\bm{A}$.
-The boundary residual after $T$ steps is $\bb_\cB^{(T)} = \bb_\cB - \bm{A}_\cB\delta\bx^{(T)}$.
-The full inference dynamics use all rows of $\bm{A}$ (all edges contribute to $\bm{\Gamma}$ and hence to $\delta\bx^{(T)}$), but the evaluation restricts to boundary rows.
-Decomposing $\bb_\cB = \bm{A}_\cB\bm{U}\bc_\cB + \bb_\cB^\perp$ with $\bb_\cB^\perp \perp \mathrm{col}(\bm{A}_\cB)$:
-\begin{equation}
-    \phi_T^\cB = \|\bb_\cB^\perp\|^2 + \sum_{i=1}^D(1-\eta\lambda_i)^{2T}c_{\cB,i}^2,
-\end{equation}
-where the eigenvalues $\lambda_i$ are those of the \emph{full} precision matrix $\bm{\Gamma}_\cG$ (all edges), and $c_{\cB,i}$ are the boundary coefficients.
-The key asymmetry: the preconditioner uses all edges; the target uses only boundary edges.
-
-\end{appendices}
-
-\end{document}s in-column-space component in the eigenbasis of $\bm{\Gamma}_\cG$ (Appendix~\ref{app:spectral}).
-The score $J_T(\cG)$ is the expectation of~\eqref{eq:decomp} over the probe batch: the coverage gap becomes expected boundary variance orthogonal to the reachable subspace, and the conditioning penalty becomes expected boundary variance along poorly conditioned directions.
-
-This is the central result.
-The architecture score separates into two independent failure modes, with a clean separation of roles: internal edges affect the score \emph{only} through the eigenvalues $\lambda_i$ (the preconditioner), never through the task covariance $\bm{\Sigma}_{\mathrm{task}}$.
-
-The \textbf{coverage gap} measures expected boundary variance that no adjustment of free states can reduce---a hard structural limitation, independent of inference budget.
-The \textbf{conditioning penalty} collects expected boundary variance along directions that are reachable but resolved too slowly.
-Eigenvalues $\lambda_i \gg 1/\eta T$ yield factor $(1-\eta\lambda_i)^{2T}\approx 0$: mode resolved.
-Eigenvalues $\lambda_i \ll 1/\eta T$ yield factor $\approx 1$: mode frozen.
-The spectral gate at $\lambda_i \sim 1/\eta T$ is an implicit complexity penalty: the graph is credited only for modes it can exploit within its compute budget.
-
-Crucially, removing an internal edge can only \emph{increase} $J_T(\cG)$: it weakens the preconditioner (reduces some $\lambda_i$) without changing the task covariance $\bm{\Sigma}_{\mathrm{task}}$.
-This eliminates the pathology where pruning artificially improves the score by removing the prediction errors that an edge was generating.
-The boundary score provides the monotonic counterpressure that makes greedy pruning well-posed.
-
-\subsection{Relation to model evidence and Bayesian model reduction}\label{sec:evidence}
-
-The Laplace-approximated log marginal likelihood at the converged state $\bx^*$ is
-\begin{equation}\label{eq:laplace}
-    -\log p(\by\mid\cG) \;\approx\; E(\bx^*;\by) \;+\; \tfrac{1}{2}\log\det(\bm{\Gamma}_\cG) \;-\; \tfrac{D}{2}\log(2\pi).
-\end{equation}
-BMR~\citep{friston2018bmr} scores reduced models by the change in variational free energy under modified priors, which is analytic given the full model's posterior precision~\citep{friston2016group}.
-Our approach has the same \emph{invert-once-reduce-many} structure but replaces the score.
-
-The Occam factor $\frac{1}{2}\sum_i\log\lambda_i$ penalises \emph{large} eigenvalues: over-committed capacity.
-The conditioning penalty penalises \emph{small} eigenvalues: computationally inaccessible capacity.
-BMR asks ``does removing this component reduce model evidence?''
-We ask ``does removing this edge reduce the graph's ability to resolve the \emph{boundary task} within its inference budget?''
-The answer is read from the same object---the precision matrix inverse---but scored against computational accessibility rather than statistical complexity.
-
-\subsection{The energy gap}\label{sec:gap}
-
-A low boundary profiled energy could reflect a flexible column space that accommodates any target.
-To measure whether the graph's geometry actually aligns with the task, we compare correct and incorrect labels:
-\begin{equation}\label{eq:egap}
-    \Delta E = \phi_T^\cB(\by_{\mathrm{wrong}}) - \phi_T^\cB(\by_{\mathrm{true}}).
-\end{equation}
-Combining fit and selectivity:
-\begin{equation}\label{eq:score}
-    \mathrm{Score}(\cG) = -\,\overline{\phi_T^\cB(\by_{\mathrm{true}})} + w\cdot\overline{\Delta E},
-\end{equation}
-averaged over a probe batch ($B\approx 100$) and 3--5 random parameter seeds.
-
-%═══════════════════════════════════════════════════════════════
-\section{Structure Search via Leverage-Score Reduction}\label{sec:search}
-%═══════════════════════════════════════════════════════════════
-
-Because each edge contributes an independent PSD term to the precision matrix, the marginal contribution of every edge to the boundary score can be evaluated analytically from a single matrix inverse.
-
-\subsection{The supergraph and its inverse}\label{sec:supergraph}
-
-Let $\cG_{\mathrm{full}}$ be the supergraph containing all $M$ candidate edges.
-Run $T$ steps of inference on $\cG_{\mathrm{full}}$ with random (or pretrained) parameters $\btheta$.
-Form the regularised precision matrix and invert once:
-\begin{equation}\label{eq:MG}
-    \bm{M}_\cG = \bm{\Gamma}_\cG + \varepsilon\bm{I} = \sum_e \bm{J}_e^\top\bm{\Lambda}_e\bm{J}_e + \varepsilon\bm{I}, \qquad \bm{M}_\cG^{-1} \;\text{computed once}.
-\end{equation}
-Record the boundary residual $\bb_\cB$ at the converged state.
-This is the analogue of fitting the full model in BMR.
-Cost: $O(D^3)$ for the inversion.
-
-\subsection{Per-edge leverage scores}\label{sec:leverage}
-
-The \textbf{leverage score} of edge $e$ measures how much of the graph's ability to resolve the boundary task depends uniquely on that edge.
-We define it as the change in boundary profiled energy under removal of edge $e$, evaluated via the Woodbury downdate.
-
-For the full precision matrix, removing edge $e$ subtracts its PSD contribution:
-\begin{equation}\label{eq:downdate}
-    (\bm{M}_\cG - \bm{J}_e^\top\bm{\Lambda}_e\bm{J}_e)^{-1} = \bm{M}_\cG^{-1} + \bm{M}_\cG^{-1}\bm{J}_e^\top(\bm{\Lambda}_e^{-1} - \bm{J}_e\bm{M}_\cG^{-1}\bm{J}_e^\top)^{-1}\bm{J}_e\bm{M}_\cG^{-1}.
-\end{equation}
-The boundary residual $\bb_\cB$ is held fixed---it depends on the data, not on which internal edges are active.
-The leverage score is the resulting increase in $\phi_T^\cB$:
-\begin{equation}\label{eq:leverage}
-    \ell_e = \phi_T^\cB\!\left(\bm{M}_\cG - \bm{J}_e^\top\bm{\Lambda}_e\bm{J}_e\right) - \phi_T^\cB\!\left(\bm{M}_\cG\right) \;\geq\; 0.
-\end{equation}
-The inequality holds because removing a PSD term from the precision matrix can only weaken inference's ability to resolve the fixed boundary target.
-High leverage means edge $e$ provides directions essential for resolving boundary errors; low leverage means the edge is redundant.
-
-All $M$ evaluations use the same $\bm{M}_\cG^{-1}$ and the same $\bb_\cB$, are independent, and are parallelisable.
-When an edge contributes a single correction direction $\bu$, the leverage on boundary residual $\bv$ reduces to
-\begin{equation}\label{eq:rank1}
-    \ell_e = \frac{(\bv^\top\bm{M}_\cG^{-1}\bu)^2}{1 - \bu^\top\bm{M}_\cG^{-1}\bu}\,,
-\end{equation}
-where the numerator measures how much of the resolved boundary residual depends on this edge and the denominator captures the degree to which other edges can compensate.
-
-\subsection{Pruning algorithm}\label{sec:pruning}
-
-The non-negativity of leverage scores makes pruning well-posed: every removal increases $\phi_T^\cB$ (or leaves it unchanged), so the score curve is monotonically non-decreasing as edges are removed.
-The pruning algorithm traces this curve and stops when the score exceeds a tolerance.
-
-\begin{algorithm}[t]
-\caption{Inference-Aware Structure Reduction}
-\label{alg:reduce}
-\begin{algorithmic}[1]
-\REQUIRE Supergraph $\cG_{\mathrm{full}}$ with $M$ edges, data batch $\{(\bx_n,\by_n)\}_{n=1}^B$
-\REQUIRE Inference steps $T$, prune fraction $\rho$, tolerance $\delta$
-\STATE Draw $\btheta\sim p(\btheta)$ (or load pretrained); run $T$ inference steps on $\cG_{\mathrm{full}}$
-\STATE Record boundary residual $\bb_\cB$ and Jacobians $\bm{J}_e$, curvatures $\bm{\Lambda}_e$ for all $e$
-\STATE Form $\bm{M}_\cG = \sum_e \bm{J}_e^\top\bm{\Lambda}_e\bm{J}_e + \varepsilon\bm{I}$; compute $\bm{M}_\cG^{-1}$
-\STATE $\phi_{\mathrm{prev}} \leftarrow \phi_T^\cB(\bm{M}_\cG)$
-\REPEAT
-    \STATE Compute leverage $\ell_e$ for all active edges $e$ via~\eqref{eq:leverage}
-    \STATE Identify lowest-leverage fraction $\rho$ of active edges
-    \FOR{each edge $e$ in removal set (ascending leverage)}
-        \STATE Update $\bm{M}_\cG^{-1}$ via Woodbury downdate~\eqref{eq:downdate}
-        \STATE Remove $e$ from active edge set
-    \ENDFOR
-    \STATE $\phi_{\mathrm{curr}} \leftarrow \phi_T^\cB(\bm{M}_\cG)$
-    \IF{$\phi_{\mathrm{curr}} - \phi_{\mathrm{prev}} > \delta$}
-        \STATE Restore last removal batch; \textbf{break}
-    \ENDIF
-    \STATE $\phi_{\mathrm{prev}} \leftarrow \phi_{\mathrm{curr}}$
-\UNTIL{no active edges remain below leverage threshold}
-\RETURN Reduced graph $\cG^*$, leverage scores, decomposed $\phi_T^\cB$
-\end{algorithmic}
-\end{algorithm}
-
-\paragraph{Why boundary scoring makes pruning well-posed.}
-Without the boundary restriction, removing an edge removes both its correction capacity \emph{and} the prediction errors it generates at random initialisation.
-Since random edges typically produce large errors, removal can decrease the total profiled energy, and the algorithm prunes to a trivial graph.
-Restricting evaluation to boundary edges eliminates this pathology: internal edges contribute only capacity (through $\bm{\Gamma}_\cG$), never evaluation error (through $\bb_\cB$).
-Removing an internal edge weakens the preconditioner without reducing the target, so $\phi_T^\cB$ can only increase.
-Removing a boundary edge eliminates one source of evaluation error but also removes its contribution to the preconditioner; its leverage score captures the net effect, which is non-negative by construction.
-
-\paragraph{Computational cost.}
-The dominant cost is the initial $O(D^3)$ inversion.
-Each pruning round costs $O(|\text{batch}| \cdot D^2 \cdot d_{\mathrm{tgt}})$ for Woodbury updates plus $O(M \cdot D^2 \cdot d_{\mathrm{tgt}})$ for leverage recomputation.
-For $D \lesssim 10{,}000$ and $M \lesssim 1{,}000$, the entire procedure completes in seconds.
-For larger $D$, the explicit inverse can be replaced by conjugate gradient solves, with leverage scores estimated via stochastic trace estimators~\citep{hutchinson1989stochastic}.
-
-\subsection{Connection to matching pursuit}\label{sec:pursuit}
-
-The \emph{forward} direction of structure search---adding edges to a minimal graph---is matching pursuit~\citep{mallat1993matching} in Jacobian space: the dictionary is the set of candidate correction operators; the signal is the boundary coverage gap $\bb_\cB^\perp$; each step selects the atom best aligned with the unexplained boundary residual.
-The backward direction (Algorithm~\ref{alg:reduce}) is the same problem viewed from the other end.
-Both exploit the additive PSD structure of the precision matrix.
-The backward direction is preferred because it starts with full information about edge interactions: leverage scores account for redundancy automatically, and the exploration problem that plagues forward search---candidates touching disconnected variables have zero gain---is absent.
-
-%═══════════════════════════════════════════════════════════════
-\section{How Structure Enters the Precision Matrix}\label{sec:structure}
-%═══════════════════════════════════════════════════════════════
-
-Each edge contributes a PSD term $\bm{J}_e^\top\bm{\Lambda}_e\bm{J}_e$ whose algebraic structure reflects the transform, whose weighting reflects the energy, and whose coupling with other terms reflects the topology.
-We trace these contributions at random initialisation through the coverage/conditioning decomposition, drawing on standard results in random matrix theory~\citep{marchenko1967distribution,gray2006toeplitz}.
-
-\paragraph{Depth.}
-A chain $\bv_0\to\cdots\to\bv_L$ produces effective Jacobians involving products of per-layer matrices whose singular values spread exponentially with depth: $\sigma_{\max}/\sigma_{\min}\sim e^{cL}$.
-Most eigenvalues of $\bm{\Gamma}_\cG$ fall below the spectral gate---the inference-side analogue of vanishing gradients.
-
-\paragraph{Skip connections.}
-A skip edge $\bv_i\to\bv_j$ adds a PSD term with $O(1)$ eigenvalues at random init---no multiplicative composition.
-It raises the smallest eigenvalues of $\bm{\Gamma}_\cG$: an additive correction to the preconditioner's spectral spread.
-Skip connections in deep graphs will have high leverage because they provide the directions that the chain alone cannot resolve within budget.
-
-\paragraph{Parallel edges.}
-$K$ parallel edges contribute $K$ independent PSD terms whose summed eigenvalues concentrate more tightly around the mean.
-Each individual parallel edge has low leverage (redundant with its neighbours); the pruning algorithm naturally thins them to the minimum set needed for adequate conditioning.
-
-\paragraph{Dense transforms.}
-$f(\bv)=\bm{W}\bv$ with i.i.d.\ entries gives a Wishart contribution $\bm{W}^\top\bm{W}$ with isotropic eigenvectors.
-No direction is preferred; dense transforms provide capacity without structural prior.
-
-\paragraph{Convolutional transforms.}
-$f(\bv)=\bm{W}*\bv$ gives a block-circulant Jacobian diagonalised by the DFT regardless of filter values.
-The precision contribution has eigenvectors fixed to the Fourier basis; only eigenvalues are random.
-On natural images, this separates signal from noise in a way isotropic eigenvectors cannot.
-
-\paragraph{Attention.}
-At random init with large key dimension, the Jacobian approximates mean-pooling composed with a random value projection, emphasising position-averaged correction directions.
-
-\paragraph{Recurrence.}
-The Jacobian from time $t$ to $T$ involves products $\prod_{s=t}^{T-1}\mathrm{diag}(\sigma'_s)\bm{W}_h$ whose singular values decay with lag; long-range modes are suppressed.
-Gated variants introduce additive paths that preserve singular values.
-
-\paragraph{Energy functions.}
-Squared error gives $\bm{\Lambda}_e=\bm{I}$ (isotropic).
-Cross-entropy gives $\bm{\Lambda}_e=\mathrm{diag}(\bm{p})-\bm{p}\bm{p}^\top$ (PSD on the simplex tangent space).
-
-%═══════════════════════════════════════════════════════════════
-\section{Related Work}\label{sec:related}
-%═══════════════════════════════════════════════════════════════
-
-\paragraph{Bayesian model reduction.}
-BMR~\citep{friston2018bmr,friston2016group} fits a full model via variational Bayes, then analytically scores every reduced model that differs only in its priors.
-Our approach inherits the \emph{invert-once-reduce-many} structure but operates on graph structure rather than parameter priors, and scores by boundary profiled energy rather than variational free energy.
-The key difference is which end of the spectrum is penalised: BMR's Occam factor penalises large eigenvalues (statistical over-commitment), while the conditioning penalty penalises small eigenvalues (computational inaccessibility).
-BMR has recently been applied to neural network pruning~\citep{beckers2024bmrs}, where parameters are removed by shrinking their prior variance to zero.
-Our method removes \emph{edges}---the natural structural unit for models whose energy decomposes over factors.
-
-\paragraph{Structure learning in graphical models.}
-The precision matrix and its decomposition over cliques are foundational to Gaussian graphical models~\citep{lauritzen1996graphical}; score-based structure learning selects graphs by penalised likelihood or independence tests~\citep{koller2009pgm}.
-Our approach uses the same object in a different regime: random initialisation of neural transforms, finite-step inference, and heterogeneous parameterised factors.
-
-\paragraph{Neural architecture search without training.}
-The Neural Tangent Kernel~\citep{jacot2018neural} linearises around parameters and produces a Gram matrix governing \emph{learning} dynamics.
-TE-NAS~\citep{chen2021tenas} and NASI~\citep{shu2022nasi} use NTK-derived quantities to rank architectures without training, but \citet{mok2022demystifying} show modern architectures leave the NTK regime quickly, and \citet{zhou2024vintk} find NTK metrics ineffective on Vision Transformers because the kernel conflates attention and MLP spectra through end-to-end composition.
-The precision-matrix approach avoids this: it decomposes over local factors, linearises ${\sim}20$ inference steps rather than $10^3$--$10^4$ training steps, and discriminates through both coverage and conditioning in a single score.
-
-\paragraph{Sparse approximation.}
-The forward direction of structure search (Section~\ref{sec:pursuit}) is matching pursuit~\citep{mallat1993matching} in Jacobian space.
-Compressed sensing theory~\citep{tropp2004greed} provides convergence guarantees under dictionary coherence conditions whose applicability to neural Jacobian dictionaries is an open question.
-
-%═══════════════════════════════════════════════════════════════
-\section{Discussion}\label{sec:discussion}
-%═══════════════════════════════════════════════════════════════
-
-We have developed a structure-learning method for energy-based models that applies the logic of Bayesian model reduction to graph structure, scored by boundary profiled energy rather than variational free energy.
-The core mechanism is the additive decomposition of the inference precision matrix over edges, which gives: a decomposed score separating coverage from conditioning, per-edge leverage scores from a single matrix inverse, and an efficient pruning algorithm via Woodbury downdates---with the guarantee that leverage scores are non-negative, making greedy pruning well-posed.
-
-The boundary evaluation principle---all edges shape inference, only boundary edges define the task---resolves the tension between an edge's dual role as both error source and correction mechanism.
-At random initialisation, where internal prediction errors are large and uninformative, this distinction is essential; on pretrained models, where internal errors are small and structured, the distinction becomes less critical but remains formally correct.
-
-The framework applies to any model with an energy that decomposes over local factors.
-At random initialisation, it selects graph structure before any training.
-On a pretrained model, the same algorithm performs post-hoc pruning, identifying edges whose contributions are redundant or below the spectral gate.
-
-The framework makes concrete predictions.
-The boundary profiled energy should correlate with trained accuracy on NAS benchmarks.
-The energy gap should track inductive bias: convolutional edges favoured on images, attention on sequences.
-Skip connections should have high leverage in deep graphs.
-Leverage-based pruning should outperform random pruning and match or exceed BMR-based pruning on energy-based models.
-The method should remain discriminative on heterogeneous search spaces where existing training-free metrics degrade.
-
-%═══════════════════════════════════════════════════════════════
-
-\bibliographystyle{plainnat}
-\begin{thebibliography}{17}
-
-\bibitem[Bai et~al.(2019)]{bai2019deep}
-S.~Bai, J.~Z.~Kolter, and V.~Koltun.
-\newblock Deep equilibrium models.
-\newblock In \emph{NeurIPS}, 2019.
-
-\bibitem[Beckers et~al.(2024)]{beckers2024bmrs}
-S.~Beckers, J.~Jantre, and others.
-\newblock {BMRS}: {B}ayesian model reduction for structured pruning.
-\newblock \emph{arXiv:2406.01345}, 2024.
-
-\bibitem[Chen et~al.(2021)]{chen2021tenas}
-W.~Chen, X.~Gong, and Z.~Wang.
-\newblock Neural architecture search on {ImageNet} in four {GPU} hours: A theoretically inspired perspective.
-\newblock In \emph{ICLR}, 2021.
-
-\bibitem[Friston et~al.(2016)]{friston2016group}
-K.~J.~Friston, V.~Litvak, A.~Oswal, A.~Razi, K.~E.~Stephan, B.~C.~M.~van Wijk, G.~Ziegler, and P.~Zeidman.
-\newblock {B}ayesian model reduction and empirical {B}ayes for group ({DCM}) studies.
-\newblock \emph{NeuroImage}, 128:413--431, 2016.
-
-\bibitem[Friston et~al.(2018)]{friston2018bmr}
-K.~Friston, T.~Parr, and P.~Zeidman.
-\newblock {B}ayesian model reduction.
-\newblock \emph{arXiv:1805.07092}, 2018.
-
-\bibitem[Gray(2006)]{gray2006toeplitz}
-R.~M.~Gray.
-\newblock \emph{Toeplitz and Circulant Matrices: A Review}.
-\newblock Now Publishers, 2006.
-
-\bibitem[Hutchinson(1989)]{hutchinson1989stochastic}
-M.~F.~Hutchinson.
-\newblock A stochastic estimator of the trace of the influence matrix.
-\newblock \emph{Commun.\ Statist.---Simula.}, 18(3):1059--1076, 1989.
-
-\bibitem[Jacot et~al.(2018)]{jacot2018neural}
-A.~Jacot, F.~Gabriel, and C.~Hongler.
-\newblock Neural tangent kernel: Convergence and generalization in neural networks.
-\newblock In \emph{NeurIPS}, 2018.
-
-\bibitem[Koller and Friedman(2009)]{koller2009pgm}
-D.~Koller and N.~Friedman.
-\newblock \emph{Probabilistic Graphical Models: Principles and Techniques}.
-\newblock MIT Press, 2009.
-
-\bibitem[Lauritzen(1996)]{lauritzen1996graphical}
-S.~L.~Lauritzen.
-\newblock \emph{Graphical Models}.
-\newblock Oxford University Press, 1996.
-
-\bibitem[Mallat and Zhang(1993)]{mallat1993matching}
-S.~Mallat and Z.~Zhang.
-\newblock Matching pursuits with time-frequency dictionaries.
-\newblock \emph{IEEE TSP}, 41(12):3397--3415, 1993.
-
-\bibitem[Marchenko and Pastur(1967)]{marchenko1967distribution}
-V.~A.~Marchenko and L.~A.~Pastur.
-\newblock Distribution of eigenvalues for some sets of random matrices.
-\newblock \emph{Matematicheskii Sbornik}, 114(4):507--536, 1967.
-
-\bibitem[Minka(2001)]{minka2001ep}
-T.~P.~Minka.
-\newblock Expectation propagation for approximate {Bayesian} inference.
-\newblock In \emph{UAI}, 2001.
-
-\bibitem[Mok et~al.(2022)]{mok2022demystifying}
-J.~Mok, B.~Na, H.~Choe, and S.~Yoon.
-\newblock Demystifying the neural tangent kernel from a practical perspective: Can it be trusted for {NAS} without training?
-\newblock In \emph{CVPR}, 2022.
-
-\bibitem[Ramsauer et~al.(2021)]{ramsauer2021hopfield}
-H.~Ramsauer et~al.
-\newblock Hopfield networks is all you need.
-\newblock In \emph{ICLR}, 2021.
-
-\bibitem[Rao and Ballard(1999)]{rao1999predictive}
-R.~P.~N.~Rao and D.~H.~Ballard.
-\newblock Predictive coding in the visual cortex.
-\newblock \emph{Nature Neuroscience}, 2(1):79--87, 1999.
-
-\bibitem[Shu et~al.(2022)]{shu2022nasi}
-Y.~Shu, Z.~Cai, Z.~Dai, T.~Ooi, and B.~K.~H.~Low.
-\newblock {NASI}: Label- and data-agnostic neural architecture search at initialization.
-\newblock In \emph{ICLR}, 2022.
-
-\bibitem[Tropp(2004)]{tropp2004greed}
-J.~A.~Tropp.
-\newblock Greed is good: Algorithmic results for sparse approximation.
-\newblock \emph{IEEE Trans.\ Inform.\ Theory}, 50(10):2231--2242, 2004.
-
-\bibitem[Whittington and Bogacz(2017)]{whittington2017approximation}
-J.~C.~R.~Whittington and R.~Bogacz.
-\newblock An approximation of the error backpropagation algorithm in a predictive coding network with local {Hebbian} synaptic plasticity.
-\newblock \emph{Neural Computation}, 29(5):1229--1262, 2017.
-
-\bibitem[Winn and Bishop(2005)]{winn2005variational}
-J.~Winn and C.~M.~Bishop.
-\newblock Variational message passing.
-\newblock \emph{JMLR}, 6:661--694, 2005.
-
-\bibitem[Zhou et~al.(2024)]{zhou2024vintk}
-W.~Zhou, J.~Huang, and others.
-\newblock When training-free {NAS} meets vision transformers: A neural tangent kernel perspective.
-\newblock In \emph{DAC}, 2024.
-
-\end{thebibliography}
-
-%═══════════════════════════════════════════════════════════════
-\newpage
-\begin{appendices}
-
-\section{Gauss--Newton Decomposition}\label{app:hessian}
-
-For a single energy term $\E_i(\bv_i,\hat{\bv}_i)$ with prediction $\hat{\bv}_i = f_e(\bv_{\mathrm{src}(e)})$, the second derivative with respect to any free variable block $\bz$ is
-\begin{equation}
-    \nabla^2_{\bz}\E_i = \bm{J}_e^{(\bz)\top}(\nabla^2_{\hat{v}}\E_i)\bm{J}_e^{(\bz)} + \sum_j(\nabla_{\hat{v}_j}\E_i)\nabla^2_{\bz}[f_e]_j,
-\end{equation}
-where $\bm{J}_e^{(\bz)}=\partial f_e/\partial\bz$.
-The first term is the Gauss--Newton part: $\bm{J}_e^{(\bz)\top}\bm{\Lambda}_e\bm{J}_e^{(\bz)}$ with $\bm{\Lambda}_e = \nabla^2_{\hat{v}}\E_i\succeq 0$.
-The second term involves second derivatives of the transform weighted by the energy gradient, and is neglected when either (a)~prediction errors $\nabla_{\hat{v}}\E_i$ are small, or (b)~transforms are close to linear.
-At random initialisation neither condition is guaranteed; the approximation is a modelling choice whose quality improves as inference reduces residuals.
-Setting $\bz=\bx$ and summing over edges gives~\eqref{eq:hessian}.
-
-\section{Task Residual}\label{app:residual}
-
-$\bm{A}_\cG\in\R^{m\times D}$ maps state perturbations $\delta\bx$ to changes in curvature-weighted prediction space, with block row $[\bm{A}_\cG]_e = \bm{\Lambda}_e^{1/2}\bm{J}_e$.
-The boundary residual $\bb_\cB\in\R^{m_\cB}$ stacks curvature-weighted prediction errors $\bm{\Lambda}_e^{1/2}(f_e(\bv_{\mathrm{src}}) - \bv_{\mathrm{tgt}(e)})$ for boundary edges $e \in \cB$ only.
-
-\section{Spectral Filter}\label{app:spectral}
-
-On the quadratic model $E = c + \frac{1}{2}\|\bm{A}\delta\bx-\bb\|^2$ with $\bm{\Gamma}=\bm{A}^\top\bm{A}=\bm{U\Lambda U}^\top$, gradient descent from $\delta\bx^{(0)}=0$ gives $\delta\bx^{(T)}=\bm{U}[\bm{I}-(\bm{I}-\eta\bm{\Lambda})^T]\bm{\Lambda}^{-1}\bm{U}^\top\bm{A}^\top\bb$.
-
-For boundary evaluation, let $\bm{A}_\cB$ denote the boundary rows of $\bm{A}$.
-The boundary residual after $T$ steps is $\bb_\cB^{(T)} = \bb_\cB - \bm{A}_\cB\delta\bx^{(T)}$.
-The full inference dynamics use all rows of $\bm{A}$ (all edges contribute to $\bm{\Gamma}$ and hence to $\delta\bx^{(T)}$), but the evaluation restricts to boundary rows.
-Decomposing $\bb_\cB = \bm{A}_\cB\bm{U}\bc_\cB + \bb_\cB^\perp$ with $\bb_\cB^\perp \perp \mathrm{col}(\bm{A}_\cB)$:
-\begin{equation}
-    \phi_T^\cB = \|\bb_\cB^\perp\|^2 + \sum_{i=1}^D(1-\eta\lambda_i)^{2T}c_{\cB,i}^2,
-\end{equation}
-where the eigenvalues $\lambda_i$ are those of the \emph{full} precision matrix $\bm{\Gamma}_\cG$ (all edges), and $c_{\cB,i}$ are the boundary coefficients.
-The key asymmetry: the preconditioner uses all edges; the target uses only boundary edges.
+The second term is zero for linear transforms and negligible when prediction errors are small.
+Summing over edges gives~\eqref{eq:hessian}.
+
+\section{Monotonicity of the Schur Complement}\label{app:monotone}
+
+Let $\bm{\Gamma}$ have the block structure~\eqref{eq:block} and let $\bm{\Delta} \succeq 0$ be a PSD matrix supported on the $I$-block (i.e., $\bm{\Delta}_{BB} = 0$, $\bm{\Delta}_{BI} = 0$).
+Then:
+\begin{align}
+    \bm{\Gamma}_\cB^*(\bm{\Gamma}) &= \bm{\Gamma}_{BB} - \bm{\Gamma}_{BI}\bm{\Gamma}_{II}^{-1}\bm{\Gamma}_{IB}, \\
+    \bm{\Gamma}_\cB^*(\bm{\Gamma}+\bm{\Delta}) &= \bm{\Gamma}_{BB} - \bm{\Gamma}_{BI}(\bm{\Gamma}_{II}+\bm{\Delta}_{II})^{-1}\bm{\Gamma}_{IB}.
+\end{align}
+Since $\bm{\Delta}_{II} \succeq 0$, we have $(\bm{\Gamma}_{II}+\bm{\Delta}_{II})^{-1} \preceq \bm{\Gamma}_{II}^{-1}$, so $\bm{\Gamma}_{BI}(\bm{\Gamma}_{II}+\bm{\Delta}_{II})^{-1}\bm{\Gamma}_{IB} \preceq \bm{\Gamma}_{BI}\bm{\Gamma}_{II}^{-1}\bm{\Gamma}_{IB}$, and therefore $\bm{\Gamma}_\cB^*(\bm{\Gamma}+\bm{\Delta}) \succeq \bm{\Gamma}_\cB^*(\bm{\Gamma})$.
+
+For a general internal edge whose PSD contribution spans both $B$ and $I$ blocks (because its Jacobian touches a boundary-connected variable), the result extends: the full Schur complement $\bm{\Gamma}_{BB} + \bm{\Delta}_{BB} - (\bm{\Gamma}_{BI}+\bm{\Delta}_{BI})(\bm{\Gamma}_{II}+\bm{\Delta}_{II})^{-1}(\bm{\Gamma}_{IB}+\bm{\Delta}_{IB})$ is at least $\bm{\Gamma}_\cB^*(\bm{\Gamma})$, by the generalised Schur complement monotonicity theorem for PSD updates to the full matrix~\citep{lauritzen1996graphical}.
 
 \end{appendices}
 
