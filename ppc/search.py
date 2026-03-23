@@ -197,8 +197,8 @@ def reduce(
     # Step 6: iterative pruning
     round_num = 0
     while active_internal:
-        # Compute trace leverage for active internal edges
-        levs = leverage_scores(graph, state, M_inv, active_internal)
+        # Compute task-aware leverage for active internal edges
+        levs = leverage_scores(graph, state, M_inv, active_internal, A_B=A_B, b_B=b_B)
 
         # Sort ascending
         sorted_edges = sorted(active_internal, key=lambda i: levs[i])
@@ -272,7 +272,9 @@ def reduce(
 
     # Final leverage scores for surviving internal edges
     final_levs = (
-        leverage_scores(graph, state, M_inv, active_internal) if active_internal else {}
+        leverage_scores(graph, state, M_inv, active_internal, A_B=A_B, b_B=b_B)
+        if active_internal
+        else {}
     )
 
     return final_graph, {

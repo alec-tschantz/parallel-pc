@@ -170,20 +170,43 @@ def precision_inverse(graph: Graph, state: State, eps: float = 1e-4) -> jax.Arra
 
 
 def leverage_scores(
-    graph: Graph, state: State, M_inv: jax.Array, edge_indices: list[int] | None = None
+    graph: Graph,
+    state: State,
+    M_inv: jax.Array,
+    edge_indices: list[int] | None = None,
+    A_B: jax.Array | None = None,
+    b_B: jax.Array | None = None,
 ) -> dict[int, float]:
-    """Trace leverage ℓ̃_e = tr(J_e M⁻¹ J_eᵀ) for specified edges.
+    """Task-aware leverage: how much edge e helps resolve boundary residual.
 
-    Returns {edge_index: leverage}. If edge_indices is None, computes for all.
+    If A_B and b_B are provided, computes task-aware leverage:
+        ℓ̃_e = (1/B) Σ_n ||J_e M⁻¹ A_Bᵀ b_{B,n}||²
+    Otherwise falls back to structural trace leverage:
+        ℓ̃_e = tr(J_e M⁻¹ J_eᵀ)
+
+    Returns {edge_index: leverage}.
     """
     if edge_indices is None:
         edge_indices = list(range(len(graph.transforms)))
+
+    task_aware = A_B is not None and b_B is not None
+    if task_aware:
+        assert A_B is not None and b_B is not None
+        # Precompute M⁻¹ A_Bᵀ b_B for all samples: (D, B)
+        # b_B: (B, m_B), A_B: (m_B, D)
+        M_inv_AtB = M_inv @ A_B.T @ b_B.T  # (D, B)
+
     scores = {}
     for i in edge_indices:
         J = edge_jacobian(graph, state, i)
         J_avg = jnp.mean(J, axis=0)  # (d_tgt, D)
-        A = J_avg @ M_inv
-        scores[i] = float(jnp.sum(A * J_avg))
+        if task_aware:
+            # J_e @ M⁻¹ A_Bᵀ b_B: (d_tgt, B)
+            projected = J_avg @ M_inv_AtB  # (d_tgt, B)
+            scores[i] = float(jnp.mean(jnp.sum(projected**2, axis=0)))
+        else:
+            A = J_avg @ M_inv
+            scores[i] = float(jnp.sum(A * J_avg))
     return scores
 
 
