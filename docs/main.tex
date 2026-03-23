@@ -277,6 +277,13 @@ Since random edges typically produce large errors, removal can decrease the tota
 Evaluating at the boundary eliminates this pathology: internal edges contribute only capacity (through $\bm{\Gamma}_\cG$), never evaluation error (through $\bm{\Sigma}_{\mathrm{task}}$).
 The task covariance framing makes this especially clean: $\bm{\Sigma}_{\mathrm{task}}$ is a property of the data distribution at the boundary, invariant to which internal edges are active.
 
+\paragraph{Frozen driving force.}
+The monotonicity argument requires that removing an internal edge only weakens the preconditioner $\bm{\Gamma}_\cG$ without changing the inference driving force.
+In practice, removing edge $e$ also removes its gradient contribution $\bm{J}_e^\top\bm{\Lambda}_e\br_e$ from the right-hand side that drives state updates.
+To maintain monotonicity, we freeze the driving force $\bm{d} = \bm{A}_\cG^\top\bb$ at the full-graph value and evaluate the reduced graph's spectral filter against this fixed $\bm{d}$.
+By Weyl's inequality, removing a PSD term from $\bm{\Gamma}_\cG$ can only decrease eigenvalues, which can only worsen the spectral filter, which can only increase the boundary residual under the frozen driving force.
+In experiments, the frozen-RHS approximation maintains monotonicity through nearly all pruning rounds; a small violation (${\sim}0.5\%$) can appear when the graph is reduced to very few edges and the linearisation becomes loose.
+
 \paragraph{Computational cost.}
 The dominant cost is the initial $O(D^3)$ inversion.
 Each pruning round costs $O(|\text{batch}| \cdot D^2 \cdot d_{\mathrm{tgt}})$ for per-sample leverage estimation plus $O(D^3)$ for exact $J_T$ evaluation via eigendecomposition.
