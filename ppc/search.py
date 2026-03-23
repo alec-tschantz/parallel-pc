@@ -61,8 +61,12 @@ def _build_subgraph(graph: Graph, keep_indices: list[int]) -> Graph:
     kept_t = [graph.transforms[i] for i in keep_indices]
     kept_tids = {graph.transforms[i].id for i in keep_indices}
     kept_e = [
-        e for e in graph.energies
-        if all(a in kept_tids or not any(a == t.id for t in graph.transforms) for a in e.args)
+        e
+        for e in graph.energies
+        if all(
+            a in kept_tids or not any(a == t.id for t in graph.transforms)
+            for a in e.args
+        )
     ]
     return Graph(variables=list(graph.variables), transforms=kept_t, energies=kept_e)
 
@@ -91,8 +95,10 @@ def reduce(
 
     B_dims, I_dims = partition_dims(graph, state, boundary_idx)
     D_B, D_I = len(B_dims), len(I_dims)
-    print(f"  {len(boundary_idx)} boundary, {len(internal_idx)} internal edges  "
-          f"(D_B={D_B}, D_I={D_I})")
+    print(
+        f"  {len(boundary_idx)} boundary, {len(internal_idx)} internal edges  "
+        f"(D_B={D_B}, D_I={D_I})"
+    )
 
     # Score full graph
     active = list(range(len(graph.transforms)))
@@ -115,8 +121,10 @@ def reduce(
         delta = best_score - current_score
 
         if delta > cfg.delta + 1e-10:
-            print(f"  Stop: best removal Δ={delta:+.6f} > δ={cfg.delta}  "
-                  f"({len(internal)} internal remain)")
+            print(
+                f"  Stop: best removal Δ={delta:+.6f} > δ={cfg.delta}  "
+                f"({len(internal)} internal remain)"
+            )
             break
 
         name = graph.transforms[best_e].id
@@ -125,15 +133,19 @@ def reduce(
         pruned_order.append(best_e)
         current_score = best_score
 
-        history.append({
-            "n_edges": len(active),
-            "score": current_score,
-            "removed": best_e,
-            "removed_name": name,
-            "delta": delta,
-        })
-        print(f"  Remove {name}: score={current_score:.6f} (Δ={delta:+.6f}), "
-              f"{len(internal)} internal left")
+        history.append(
+            {
+                "n_edges": len(active),
+                "score": current_score,
+                "removed": best_e,
+                "removed_name": name,
+                "delta": delta,
+            }
+        )
+        print(
+            f"  Remove {name}: score={current_score:.6f} (Δ={delta:+.6f}), "
+            f"{len(internal)} internal left"
+        )
 
     return _build_subgraph(graph, active), {
         "history": history,
@@ -146,7 +158,10 @@ def reduce(
 
 
 def random_reduce(
-    graph: Graph, state, n_keep_internal: int, key: jax.Array,
+    graph: Graph,
+    state,
+    n_keep_internal: int,
+    key: jax.Array,
 ) -> Graph:
     """Randomly keep n_keep_internal internal edges. All boundary edges kept."""
     edges = classify_edges(graph, state)

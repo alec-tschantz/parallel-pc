@@ -6,8 +6,6 @@ J(S) = tr(Γ_B*(S)^{-1} Σ_task)
 dimensions after marginalising I-type dimensions. No driving force, no inference.
 """
 
-from __future__ import annotations
-
 from typing import Any
 
 import jax
@@ -46,7 +44,9 @@ def classify_edges(graph: Graph, state: State) -> dict[str, list[int]]:
 
 
 def partition_dims(
-    graph: Graph, state: State, boundary_idx: list[int],
+    graph: Graph,
+    state: State,
+    boundary_idx: list[int],
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Partition free variable dimensions into B-type and I-type.
 
@@ -94,8 +94,17 @@ def edge_jacobian(graph: Graph, state: State, transform_idx: int) -> jax.Array:
             o, sz, sh = layout.offsets[s], layout.sizes[s], layout.shapes[s]
             srcs.append(flat_single[o : o + sz].reshape(sh))
         out = t.module(*srcs)  # type: ignore
-        pred = jnp.concatenate([v.ravel() for v in out]) if isinstance(out, tuple) else out.ravel()
-        tgt = jnp.concatenate([flat_single[layout.offsets[n] : layout.offsets[n] + layout.sizes[n]] for n in t.tgt])
+        pred = (
+            jnp.concatenate([v.ravel() for v in out])
+            if isinstance(out, tuple)
+            else out.ravel()
+        )
+        tgt = jnp.concatenate(
+            [
+                flat_single[layout.offsets[n] : layout.offsets[n] + layout.sizes[n]]
+                for n in t.tgt
+            ]
+        )
         return tgt - pred
 
     J = jax.vmap(jax.jacrev(residual))(state.flat)
@@ -103,7 +112,8 @@ def edge_jacobian(graph: Graph, state: State, transform_idx: int) -> jax.Array:
 
 
 def precompute_edge_data(
-    graph: Graph, state: State,
+    graph: Graph,
+    state: State,
 ) -> tuple[dict[int, jax.Array], dict[int, jax.Array]]:
     """Batch-averaged Jacobians and per-sample residuals for all edges.
 
@@ -123,11 +133,18 @@ def precompute_edge_data(
                 o, sz, sh = layout.offsets[s], layout.sizes[s], layout.shapes[s]
                 srcs.append(flat_single[o : o + sz].reshape(sh))
             out = _t.module(*srcs)  # type: ignore
-            return jnp.concatenate([v.ravel() for v in out]) if isinstance(out, tuple) else out.ravel()
+            return (
+                jnp.concatenate([v.ravel() for v in out])
+                if isinstance(out, tuple)
+                else out.ravel()
+            )
 
         pred = jax.vmap(_fwd)(flat)
         tgt = jnp.concatenate(
-            [flat[:, layout.offsets[n] : layout.offsets[n] + layout.sizes[n]] for n in t.tgt],
+            [
+                flat[:, layout.offsets[n] : layout.offsets[n] + layout.sizes[n]]
+                for n in t.tgt
+            ],
             axis=1,
         )
         all_r[i] = tgt - pred
