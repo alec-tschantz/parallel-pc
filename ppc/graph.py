@@ -1,7 +1,6 @@
 import math
 import warnings
 from dataclasses import dataclass
-from collections.abc import Sequence
 from typing import Any, Callable, NamedTuple
 
 import numpy as np
@@ -374,17 +373,3 @@ def _bucket_energies(
         )
 
     return buckets
-
-
-def expand(
-    graph: Graph,
-    new_transforms: Sequence[Transform] = (),
-    new_energies: Sequence[Energy] = (),
-    new_variables: Sequence[Variable] = (),
-) -> Graph:
-    """Return a new Graph with additional variables, transforms, and energies."""
-    return Graph(
-        variables=list(graph.variables) + list(new_variables),
-        transforms=list(graph.transforms) + list(new_transforms),
-        energies=list(graph.energies) + list(new_energies),
-    )

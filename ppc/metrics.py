@@ -1,9 +1,12 @@
-"""Boundary Schur complement scoring for structure learning.
+"""A-optimal scoring for structure learning.
 
-J(S) = tr(Γ_B*(S)^{-1} Σ_task)
+J(S) = tr(H_S^{-1} Σ_task)
 
-Γ_B* is the Schur complement of the precision matrix on B-type variable
-dimensions after marginalising I-type dimensions. No driving force, no inference.
+H_S = Σ_{e∈S} J_e^T J_e + εI is the regularised Gauss-Newton Hessian.
+Σ_task is the task covariance from data-facing edge residuals projected
+into state space.  Lower score = better structure.
+
+No inference, no training — single forward pass for Jacobians.
 """
 
 from typing import Any
@@ -13,11 +16,6 @@ import jax.numpy as jnp
 
 from .graph import Graph
 from .types import State
-
-
-# ---------------------------------------------------------------------------
-# Edge classification
-# ---------------------------------------------------------------------------
 
 
 def classify_edges(graph: Graph, state: State) -> dict[str, list[int]]:
@@ -36,51 +34,6 @@ def classify_edges(graph: Graph, state: State) -> dict[str, list[int]]:
                 break
         (boundary if is_boundary else internal).append(i)
     return {"boundary": boundary, "internal": internal}
-
-
-# ---------------------------------------------------------------------------
-# Variable partition: B-type vs I-type
-# ---------------------------------------------------------------------------
-
-
-def partition_dims(
-    graph: Graph,
-    state: State,
-    boundary_idx: list[int],
-) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """Partition free variable dimensions into B-type and I-type.
-
-    A free variable is B-type if any boundary edge touches it (src or tgt).
-    A free variable is I-type otherwise.
-
-    Returns (B_dims, I_dims) as sorted index arrays into the flat state buffer.
-    """
-    layout = graph.layout
-    free_mask = state.free_mask
-
-    b_var_names: set[str] = set()
-    for i in boundary_idx:
-        t = graph.transforms[i]
-        for name in list(t.src) + list(t.tgt):
-            b_var_names.add(name)
-
-    B_dims, I_dims = [], []
-    for v in graph.variables:
-        o, s = layout.offsets[v.name], layout.sizes[v.name]
-        if float(free_mask[o]) == 0.0:
-            continue  # clamped
-        dims = list(range(o, o + s))
-        if v.name in b_var_names:
-            B_dims.extend(dims)
-        else:
-            I_dims.extend(dims)
-
-    return jnp.array(sorted(B_dims), dtype=int), jnp.array(sorted(I_dims), dtype=int)
-
-
-# ---------------------------------------------------------------------------
-# Per-edge data
-# ---------------------------------------------------------------------------
 
 
 def edge_jacobian(graph: Graph, state: State, transform_idx: int) -> jax.Array:
@@ -118,7 +71,7 @@ def precompute_edge_data(
     """Batch-averaged Jacobians and per-sample residuals for all edges.
 
     Returns (all_J, all_r):
-        all_J[e]: (d_tgt, D_full) batch-averaged Jacobian
+        all_J[e]: (d_tgt, D) batch-averaged Jacobian
         all_r[e]: (N, d_tgt) per-sample residuals
     """
     layout = graph.layout
@@ -151,80 +104,59 @@ def precompute_edge_data(
     return all_J, all_r
 
 
-# ---------------------------------------------------------------------------
-# Boundary Schur complement score
-# ---------------------------------------------------------------------------
+def task_covariance(
+    all_J: dict[int, jax.Array],
+    all_r: dict[int, jax.Array],
+    boundary_idx: list[int],
+) -> jax.Array:
+    """Task covariance from data-facing edge residuals.
+
+    Σ_task = (1/N) Σ_n g_n g_n^T
+    where g_n = Σ_{e∈boundary} J_e^T r_{e,n}
+
+    Projects data variance into state space.
+    """
+    D = all_J[next(iter(all_J))].shape[1]
+    N = all_r[boundary_idx[0]].shape[0]
+    g = jnp.zeros((N, D))
+    for e in boundary_idx:
+        g = g + all_r[e] @ all_J[e]  # (N, D)
+    return (g.T @ g) / N  # (D, D)
 
 
 def score_edge_set(
     all_J: dict[int, jax.Array],
-    all_r: dict[int, jax.Array],
-    boundary_idx: list[int],
     edge_set: list[int],
-    B_dims: jnp.ndarray,
-    I_dims: jnp.ndarray,
+    Sigma_task: jax.Array,
     eps: float = 1e-4,
 ) -> dict[str, Any]:
-    """Boundary Schur complement score: J(S) = tr(Γ_B*^{-1} Σ_task).
+    """A-optimal score: J(S) = tr(H_S^{-1} Σ_task).
 
-    Γ_B* is the Schur complement on B-dims after marginalising I-dims.
-    Σ_task is the task covariance in B-dim state space, computed from
-    boundary edge driving forces.
+    H_S = Σ_{e∈S} J_e^T J_e + εI.  Lower score = better structure.
 
-    Returns dict with score, eigenvalues of Γ_B*.
+    Returns dict with score and eigenvalues of H_S.
     """
-    D_full = all_J[next(iter(all_J))].shape[1]
-    D_B = len(B_dims)
-    D_I = len(I_dims)
-
-    # Build Γ_S in full space
-    Gamma = eps * jnp.eye(D_full)
+    D = Sigma_task.shape[0]
+    H = eps * jnp.eye(D)
     for e in edge_set:
-        Gamma = Gamma + all_J[e].T @ all_J[e]
+        H = H + all_J[e].T @ all_J[e]
 
-    # Extract blocks
-    G_BB = Gamma[jnp.ix_(B_dims, B_dims)]
-
-    if D_I == 0:
-        Gamma_B_star = G_BB
-    else:
-        G_BI = Gamma[jnp.ix_(B_dims, I_dims)]
-        G_II = Gamma[jnp.ix_(I_dims, I_dims)]
-        Gamma_B_star = G_BB - G_BI @ jnp.linalg.solve(G_II, G_BI.T)
-
-    # Task covariance in B-dim state space:
-    # g_{B,n} = Σ_{e∈boundary} (J_e^T r_{e,n})[B_dims]
-    N = next(iter(all_r.values())).shape[0]
-    g_B = jnp.zeros((N, D_B))
-    for e in boundary_idx:
-        force = all_r[e] @ all_J[e]  # (N, D_full)
-        g_B = g_B + force[:, B_dims]
-
-    Sigma_task = (g_B.T @ g_B) / N  # (D_B, D_B)
-
-    # Score: tr(Γ_B*^{-1} Σ_task)
-    score = float(jnp.trace(jnp.linalg.solve(Gamma_B_star, Sigma_task)))
-
-    eigenvalues = jnp.linalg.eigvalsh(Gamma_B_star)
+    score = float(jnp.trace(jnp.linalg.solve(H, Sigma_task)))
+    eigenvalues = jnp.linalg.eigvalsh(H)
 
     return {"score": score, "eigenvalues": eigenvalues}
 
 
 def score_each_removal(
     all_J: dict[int, jax.Array],
-    all_r: dict[int, jax.Array],
-    boundary_idx: list[int],
     current_edges: list[int],
     candidates: list[int],
-    B_dims: jnp.ndarray,
-    I_dims: jnp.ndarray,
+    Sigma_task: jax.Array,
     eps: float = 1e-4,
 ) -> dict[int, float]:
     """Score of S \\ {e} for each candidate e. Returns {edge_idx: score_without}."""
     scores = {}
     for e in candidates:
         reduced = [i for i in current_edges if i != e]
-        scores[e] = score_edge_set(
-            all_J, all_r, boundary_idx, reduced, B_dims, I_dims, eps
-        )["score"]
+        scores[e] = score_edge_set(all_J, reduced, Sigma_task, eps)["score"]
     return scores

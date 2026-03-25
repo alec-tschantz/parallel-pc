@@ -1,60 +1,32 @@
-"""Structure learning via boundary Schur complement backward elimination.
+"""Structure learning via A-optimal backward elimination.
 
-J(S) = tr(Γ_B*(S)^{-1} Σ_task)
+J(S) = tr(H_S^{-1} Σ_task)
 
-No inference simulation. Single forward pass for Jacobians.
+Single forward pass for Jacobians, one probe batch for task covariance,
+then iteratively remove edges that least increase the score.
+No inference, no training.
 """
 
 from dataclasses import dataclass
-from typing import Callable
 
 import jax
 import jax.numpy as jnp
 
 from .engine import init
-from .graph import Graph, expand
+from .graph import Graph
 from .metrics import (
     classify_edges,
-    partition_dims,
     precompute_edge_data,
+    task_covariance,
     score_edge_set,
     score_each_removal,
 )
-from .types import Energy, Transform
 
 
 @dataclass
 class SearchConfig:
-    eps: float = 1e-4  # ridge regularisation (= 1/ηT spectral gate)
+    eps: float = 1e-4  # regularisation (= 1/ηT spectral gate)
     delta: float = 0.0  # stopping tolerance (0 = stop when any removal hurts)
-
-
-@dataclass
-class Candidate:
-    name: str
-    transform_factory: Callable[[jax.Array], Transform]
-    energy_factory: Callable[[str], Energy]
-
-
-def instantiate_candidate(
-    candidate: Candidate, edge_idx: int, key: jax.Array
-) -> tuple[Transform, Energy]:
-    t = candidate.transform_factory(key)
-    tid = f"t_e{edge_idx}_{candidate.name}"
-    t = Transform(tid, t.module, src=t.src, tgt=t.tgt)
-    return t, candidate.energy_factory(tid)
-
-
-def build_supergraph(
-    graph: Graph, candidates: list[Candidate], key: jax.Array
-) -> Graph:
-    keys = jax.random.split(key, len(candidates))
-    new_t, new_e = [], []
-    for i, cand in enumerate(candidates):
-        t, e = instantiate_candidate(cand, i, keys[i])
-        new_t.append(t)
-        new_e.append(e)
-    return expand(graph, new_transforms=new_t, new_energies=new_e)
 
 
 def _build_subgraph(graph: Graph, keep_indices: list[int]) -> Graph:
@@ -77,48 +49,47 @@ def reduce(
     cfg: SearchConfig,
     key: jax.Array,
 ) -> tuple[Graph, dict]:
-    """Backward elimination via boundary Schur complement.
+    """Backward elimination via A-optimal score.
 
-    Single forward pass → Jacobians → iteratively remove internal edges
-    that least increase the score. Stops when every removal exceeds tolerance.
+    Single forward pass → Jacobians → task covariance → iteratively remove
+    internal edges that least increase the score.
+    Stops when every removal would increase score by more than δ.
 
     Returns (reduced_graph, diagnostics).
     """
-    # Linearisation point: initial state (no inference)
     state = init(graph, clamps, key=key)
-
-    # Precompute all Jacobians and residuals (single forward pass)
     all_J, all_r = precompute_edge_data(graph, state)
     edges = classify_edges(graph, state)
     boundary_idx = edges["boundary"]
     internal_idx = edges["internal"]
 
-    B_dims, I_dims = partition_dims(graph, state, boundary_idx)
-    D_B, D_I = len(B_dims), len(I_dims)
+    Sigma_task = task_covariance(all_J, all_r, boundary_idx)
+
+    D = all_J[next(iter(all_J))].shape[1]
     print(
         f"  {len(boundary_idx)} boundary, {len(internal_idx)} internal edges  "
-        f"(D_B={D_B}, D_I={D_I})"
+        f"(D={D})"
     )
 
-    # Score full graph
     active = list(range(len(graph.transforms)))
     internal = list(internal_idx)
-    result = score_edge_set(all_J, all_r, boundary_idx, active, B_dims, I_dims, cfg.eps)
+    result = score_edge_set(all_J, active, Sigma_task, cfg.eps)
     current_score = result["score"]
 
     history = [{"n_edges": len(active), "score": current_score, "removed": None}]
     pruned_order = []
     print(f"  Full graph: score={current_score:.6f}")
 
-    # Backward elimination
+    # Backward elimination: remove edge whose removal least increases score
     while internal:
         removal_scores = score_each_removal(
-            all_J, all_r, boundary_idx, active, internal, B_dims, I_dims, cfg.eps
+            all_J, active, internal, Sigma_task, cfg.eps
         )
 
+        # Find edge whose removal gives lowest score (least damage)
         best_e = min(internal, key=lambda e: removal_scores[e])
         best_score = removal_scores[best_e]
-        delta = best_score - current_score
+        delta = best_score - current_score  # ≥ 0 (removing PSD term can only hurt)
 
         if delta > cfg.delta + 1e-10:
             print(
@@ -155,19 +126,3 @@ def reduce(
         "pruned_order": pruned_order,
         "final_edges": [graph.transforms[i].id for i in active],
     }
-
-
-def random_reduce(
-    graph: Graph,
-    state,
-    n_keep_internal: int,
-    key: jax.Array,
-) -> Graph:
-    """Randomly keep n_keep_internal internal edges. All boundary edges kept."""
-    edges = classify_edges(graph, state)
-    internal = edges["internal"]
-    if n_keep_internal >= len(internal):
-        return graph
-    perm = jax.random.permutation(key, len(internal))
-    keep = sorted([internal[int(perm[i])] for i in range(n_keep_internal)])
-    return _build_subgraph(graph, sorted(edges["boundary"] + keep))
